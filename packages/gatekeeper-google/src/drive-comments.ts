@@ -12,23 +12,23 @@
  */
 
 import {
-  ActionApplyError, ActionOutcomeUnknownError, defineActions, type ActionSubmitter,
-  type JournalEntry, type TaggedAction,
+  ActionApplyError, ActionOutcomeUnknownError, type ActionDefinition, type JournalEntry,
+  type TaggedAction,
 } from "@gadgets/gatekeeper-kit/actions";
 import {
   buildDescription, codeSpan, type ActionDescriptionBuilder,
 } from "@gadgets/gatekeeper-kit/action-description";
 import type { ActionKind } from "@gadgets/workshop-shared/gatekeeper";
 import {
-  commentWriteFailure, DriveApiRequestError, isFileInvisible, isInsufficientScope,
-  COMMENT_WRITE_MAX_MS, type DriveApi, type DriveCommentRecord, type DriveReplyRecord,
-  type DriveScopeNode,
+  DriveApiRequestError, isFileInvisible, isInsufficientScope, COMMENT_WRITE_MAX_MS,
+  type DriveApi, type DriveCommentRecord, type DriveReplyRecord,
 } from "./drive-api";
-import { isDirectChild, readFolderLocation } from "./drive-folder-scope";
-import type { DriveBindingScope } from "./drive-session";
-import type { DriveBindingAccess, DriveComment, DriveCommentReply } from "./drive-types";
+import type { DriveComment, DriveCommentReply } from "./drive-types";
+import {
+  pendingId, proveTarget, requireWritable, sendOnce, WRITES_GRANT_MISSING,
+  type DriveWritesHost, type DriveWriteTargetPayload, type QueuedWrite, type WriteAttempt,
+} from "./drive-writes";
 import { obsContext } from "./observability";
-import { driveResourceUrl, type DriveAccessLevel } from "./resources";
 
 const logger = obsContext.createLogger({
   component: "gatekeeper.google.drive.comments", vendorId: "google",
@@ -45,58 +45,6 @@ const logger = obsContext.createLogger({
  */
 const DRIVE_COMMENTS: ActionKind = { tag: "driveComments", label: "Drive comments" };
 
-/** The refusal for a read and write binding whose account does not hold the Drive writes grant. */
-export const WRITES_GRANT_MISSING =
-  "Changes need a permission this Google account hasn't granted, or no longer grants. In " +
-  "Workshop, start adding a Google Drive connection for this account, choose all of Drive or a " +
-  "folder, then \"Read and write\", and select \"Allow changes\". The permission covers every " +
-  "read and write Drive connection on the account, so the dialog can then be closed.";
-
-/**
- * The refusal for a write on a read-only binding of `scope`. It ends with the URL to request
- * instead and nothing after it, and no URL in it is followed by punctuation: copied with a
- * URL, that would change its last parameter's value, which then reads as read-only. All of
- * Drive is the widest connection there is, so its refusal names the narrower ones first.
- */
-export function readOnlyRefusal(scope: DriveBindingScope): string {
-  let url = driveResourceUrl(
-    scope.kind === "account" ? { kind: "driveAccount", access: "write" }
-    : scope.kind === "folder" ? { kind: "driveFolder", folderId: scope.folderId, access: "write" }
-    : { kind: "driveFile", fileId: scope.fileId, access: "write" });
-  let request = scope.kind === "account"
-    ? "To change one file, or the files of one folder, request the narrower " +
-      "https://drive.google.com/file/d/<fileId>/view?access=write or " +
-      "https://drive.google.com/drive/folders/<folderId>?access=write instead. For all of " +
-      "Drive, request this resource URL:"
-    : "Request one with this resource URL:";
-  return "This Google Drive connection is read-only, so it cannot make changes. Changes take a " +
-    `connection with read and write access, which the user chooses when connecting. ${request} ${
-      url}`;
-}
-
-/** What decides whether a binding may make changes. */
-export type DriveWriteGate = {
-  /** The binding's access level; anything but `"write"` is read-only. */
-  access?: DriveAccessLevel;
-  /** The binding's own scope, which a read-only refusal names the read and write URL of. */
-  scope: DriveBindingScope;
-  /**
-   * Whether the account holds the Drive writes grant, read live. Rejects when the account itself
-   * cannot answer for the binding, as one that was disconnected cannot: no grant would lift that.
-   */
-  holdsGrant(): Promise<boolean>;
-};
-
-/**
- * Why a binding cannot make changes now, or `undefined` when it can: it is read-only, or its
- * account does not hold the Drive writes grant. Asked when a write is queued and again when it
- * is applied. A failure of the grant's read is passed on as it came.
- */
-export async function writeRefusal(gate: DriveWriteGate): Promise<string | undefined> {
-  if (gate.access !== "write") return readOnlyRefusal(gate.scope);
-  return (await gate.holdsGrant()) ? undefined : WRITES_GRANT_MISSING;
-}
-
 /** The refusal for a reply to, or a resolve of, a comment that is itself still queued. */
 export const PENDING_COMMENT_REFUSED =
   "That comment is waiting for approval; reply to it once it is posted.";
@@ -112,9 +60,6 @@ const RESOLVED_SINCE_QUEUED = "That comment was resolved after this reply was qu
 const NO_LONGER_IN_SCOPE = "That file is no longer in this connection's scope.";
 const CANNOT_COMMENT = "The connected account can no longer comment on that file.";
 
-/** The ID a queued write is shown under until it is posted. */
-const PENDING_PREFIX = "pending:";
-
 /** Longest excerpt of the comment a reply answers that its approval shows, in characters. */
 const PARENT_EXCERPT_CHARS = 200;
 
@@ -125,19 +70,6 @@ const RECONCILE_WINDOW_MS = Math.max(5 * 60 * 1000, 2 * COMMENT_WRITE_MAX_MS);
 /** Most pages one look for a posted comment reads. */
 const MAX_RECONCILE_PAGES = 50;
 
-/** Longest part of a file's name its approval shows, in characters. */
-const FILE_NAME_CHARS = 200;
-
-/**
- * What a write's approval shows of the file's name: all of it, or its first 200 characters and
- * an ellipsis.
- */
-export function shownFileName(name: string): string {
-  let characters = [...name];
-  return characters.length > FILE_NAME_CHARS
-    ? `${characters.slice(0, FILE_NAME_CHARS).join("")}…` : name;
-}
-
 /** The comment a reply or resolve answers, as it stood when queued, for the approver. */
 export type CommentParent = {
   author: string;
@@ -147,13 +79,11 @@ export type CommentParent = {
   cut?: true;
 };
 
-/** What every Drive comment write carries about the file it is on. */
-export type CommentTargetPayload = {
-  fileId: string;
-  /** The file's name when the write was queued, as {@link shownFileName} cuts it, for the approver. */
-  fileName?: string;
-  /** For a folder binding, the path from the bound root to the file's parent, proven at apply. */
-  folderIds?: string[];
+/**
+ * What every Drive comment write carries about the file it is on: the target every Drive write is
+ * proved by at apply, and the time a pending comment or reply shows.
+ */
+export type CommentTargetPayload = DriveWriteTargetPayload & {
   /** RFC 3339, shown as the pending item's creation time. */
   queuedAt: string;
 };
@@ -182,54 +112,6 @@ export type DriveCommentActions = {
 
 /** One queued Drive comment write. */
 export type DriveCommentAction = TaggedAction<DriveCommentActions>;
-
-/** What a Drive session needs of its gatekeeper to show and queue comment writes. */
-export type DriveCommentQueue = {
-  /** The binding's access, which the session reports with its scope. */
-  access: DriveBindingAccess;
-  /** Why this binding cannot make changes now, or `undefined` when it can (see {@link writeRefusal}). */
-  writeRefusal(): Promise<string | undefined>;
-  /** Queues one write for approval through `queue`, returning its action ID. */
-  submit<K extends keyof DriveCommentActions>(
-    queue: ActionSubmitter, kind: K, payload: DriveCommentActions[K],
-  ): Promise<number>;
-  /**
-   * Runs `read` with the writes awaiting a decision while none is being applied or rejected, so a
-   * write Drive posts mid-read is not shown both as posted and as pending.
-   */
-  undecided<T>(
-    read: (pending: readonly JournalEntry<DriveCommentAction>[]) => Promise<T>,
-  ): Promise<T>;
-};
-
-/** A send that may have reached Drive, recorded before it went. */
-export type CommentAttempt = {
-  at: number;
-  /** The account's replies already on the comment that look like what this send posts. */
-  existing?: string[];
-};
-
-/** What applying a Drive comment write needs. */
-export type DriveCommentsHost = {
-  api: Pick<DriveApi,
-    "getScopeNodes" | "getComment" | "listComments" | "listReplies" | "createComment" |
-    "createReply">;
-  /** The binding's scope, read when an action applies. */
-  scope(): DriveBindingScope;
-  /** Why this binding cannot make changes now, read when an action applies. */
-  writeRefusal(): Promise<string | undefined>;
-  /** Each send's marker, by action ID, kept until the write is settled. */
-  attempts: {
-    get(id: number): CommentAttempt | undefined;
-    put(id: number, attempt: CommentAttempt): void;
-    delete(id: number): void;
-  };
-};
-
-/** Whether `id` names a write still queued rather than a comment on Drive. */
-export function isPendingCommentId(id: string): boolean {
-  return id.startsWith(PENDING_PREFIX);
-}
 
 /** A comment as Drive shows it, or `undefined` once it is deleted or not found. */
 export async function readLiveComment(
@@ -293,7 +175,7 @@ export function pendingComment(
   id: number, payload: DriveCommentActions["createComment"],
 ): DriveComment {
   return {
-    id: `${PENDING_PREFIX}${id}`, author: PENDING_AUTHOR, text: payload.content,
+    id: pendingId(id), author: PENDING_AUTHOR, text: payload.content,
     createdTime: new Date(payload.queuedAt), resolved: false, replies: [], pending: true,
   };
 }
@@ -307,25 +189,38 @@ export function pendingReply(
   let replyAction: DriveCommentReply["action"] = action.kind === "resolveComment" ? "resolve"
     : action.payload.reopens ? "reopen" : undefined;
   return {
-    id: `${PENDING_PREFIX}${id}`, author: PENDING_AUTHOR, text: payload.content ?? "",
+    id: pendingId(id), author: PENDING_AUTHOR, text: payload.content ?? "",
     createdTime: new Date(payload.queuedAt), ...(replyAction ? { action: replyAction } : {}),
     pending: true,
   };
 }
 
+/** Whether `entry` is a comment write: one queued under a comment definition's name. */
+function isCommentEntry(entry: QueuedWrite): entry is JournalEntry<DriveCommentAction> {
+  return Object.hasOwn(DRIVE_COMMENT_DEFINITIONS, entry.action.kind);
+}
+
+/** The comment writes among `pending`. */
+export function commentEntries(
+  pending: readonly QueuedWrite[],
+): JournalEntry<DriveCommentAction>[] {
+  return pending.filter(isCommentEntry);
+}
+
 /**
  * One page of `fileId`'s comments with this binding's undecided writes for the file: each queued
  * reply or resolve under the comment it answers, and, on the last page, each queued comment.
- * `quotesDocument` says whether the page shows a queued comment whose body was checked against the
- * file's text as a Google Doc.
+ * `pending` holds the binding's undecided writes of every kind, of which the comment ones are
+ * read. `quotesDocument` says whether the page shows a queued comment whose body was checked
+ * against the file's text as a Google Doc.
  */
 export function overlayPending(
   fileId: string,
   comments: DriveComment[],
-  pending: readonly JournalEntry<DriveCommentAction>[],
+  pending: readonly QueuedWrite[],
   last: boolean,
 ): { comments: DriveComment[]; quotesDocument: boolean } {
-  let mine = pending.filter(({ action }) => action.payload.fileId === fileId);
+  let mine = commentEntries(pending).filter(({ action }) => action.payload.fileId === fileId);
   let shown = comments.map(comment => {
     let replies = mine.flatMap(({ id, action }) =>
       action.kind !== "createComment" && action.payload.commentId === comment.id
@@ -344,41 +239,19 @@ export function overlayPending(
 }
 
 /**
- * The file as the binding's scope reaches it at apply, with whether this account may comment, or
- * `undefined` when it is out of scope or invisible. A folder binding re-proves every saved link
- * and the file's place under the last, in one batch.
- */
-async function scopedFile(
-  host: DriveCommentsHost, payload: CommentTargetPayload,
-): Promise<DriveScopeNode | undefined> {
-  let scope = host.scope();
-  if (scope.kind === "file" && payload.fileId !== scope.fileId) return undefined;
-  if (scope.kind !== "folder") return (await host.api.getScopeNodes([payload.fileId]))[0];
-  let folderIds = payload.folderIds;
-  if (!folderIds?.length || folderIds[0] !== scope.folderId) return undefined;
-  let nodes = await host.api.getScopeNodes([...folderIds, payload.fileId]);
-  let file = nodes.pop();
-  // Handed the nodes already read, the location check can only refuse.
-  let path = await readFolderLocation({ folderIds }, async () => nodes).catch(() => undefined);
-  return file && path && isDirectChild(file, path[path.length - 1]) ? file : undefined;
-}
-
-/**
- * Refuses a write that may not be made at apply, having posted nothing: for good, except while the
- * account does not hold the grant, which leaves the write pending for a later approval.
- * @returns The comment a reply or resolve answers, as it stands now.
+ * Refuses a write that may not be made at apply, having posted nothing: for good, except for a
+ * refusal a later approval can pass, which leaves the write pending.
+ * @returns What the send's marker notes: the account's replies already on the comment that look
+ * like what this send posts.
  */
 async function requireStillAllowed(
-  host: DriveCommentsHost, action: DriveCommentAction,
-): Promise<DriveCommentRecord | undefined> {
-  let refused = await host.writeRefusal();
-  // Allowing changes again lifts the grant's refusal; a binding's access level never changes.
-  if (refused === WRITES_GRANT_MISSING) throw new Error(refused);
-  if (refused !== undefined) throw new ActionApplyError(refused);
-  let file = await scopedFile(host, action.payload);
+  host: DriveWritesHost, action: DriveCommentAction,
+): Promise<{ existing?: string[] }> {
+  await requireWritable(host);
+  let file = await proveTarget(host, action.payload);
   if (!file) throw new ActionApplyError(NO_LONGER_IN_SCOPE);
   if (file.canComment !== true) throw new ActionApplyError(CANNOT_COMMENT);
-  if (action.kind === "createComment") return undefined;
+  if (action.kind === "createComment") return {};
   let comment = await readLiveComment(host.api, action.payload.fileId, action.payload.commentId);
   if (!comment) throw new ActionApplyError(COMMENT_NOT_FOUND);
   if (action.kind === "resolveComment" && comment.resolved) {
@@ -388,7 +261,14 @@ async function requireStillAllowed(
   if (action.kind === "createReply" && comment.resolved && !action.payload.reopens) {
     throw new ActionApplyError(RESOLVED_SINCE_QUEUED);
   }
-  return comment;
+  // A reply already there, such as an earlier resolve of a since reopened comment, is not this
+  // send's. Comments are not listed first: taking an identical one for this send drops a duplicate.
+  let from = Date.now() - CLOCK_SKEW_MS;
+  return {
+    existing: comment.replies
+      .filter(reply => mineFrom(reply, from) && looksSent(action, reply))
+      .map(reply => reply.id),
+  };
 }
 
 /** Every item a list read yields, page by page, refusing a token Drive hands back twice. */
@@ -439,7 +319,7 @@ function looksSent(
  * A look Google refuses for a missing scope throws the grant's refusal instead, which is retried.
  */
 async function findPosted(
-  host: DriveCommentsHost, action: DriveCommentAction, attempt: CommentAttempt,
+  host: Pick<DriveWritesHost, "api">, action: DriveCommentAction, attempt: WriteAttempt,
 ): Promise<string | undefined> {
   let from = attempt.at - CLOCK_SKEW_MS;
   let until = attempt.at + RECONCILE_WINDOW_MS + CLOCK_SKEW_MS;
@@ -484,18 +364,18 @@ async function findPosted(
 }
 
 /** Whether a send's window has closed, so a look that finds nothing proves it posted nothing. */
-function windowClosed(attempt: CommentAttempt): boolean {
+function windowClosed(attempt: WriteAttempt): boolean {
   return attempt.at + RECONCILE_WINDOW_MS < Date.now() - CLOCK_SKEW_MS;
 }
 
 /** The end of a look that found nothing while Drive may still show what the send posted. */
-function notShownYet(attempt: CommentAttempt): Error {
+function notShownYet(attempt: WriteAttempt): Error {
   let after = new Date(attempt.at + RECONCILE_WINDOW_MS + CLOCK_SKEW_MS);
   return new Error("Google Drive may still be posting this, so it wasn't sent again; approve " +
     `again after ${after.toISOString().slice(11, 16)} UTC.`);
 }
 
-function send(api: DriveCommentsHost["api"], action: DriveCommentAction): Promise<{ id: string }> {
+function send(api: DriveWritesHost["api"], action: DriveCommentAction): Promise<{ id: string }> {
   let { payload } = action;
   switch (action.kind) {
     case "createComment": return api.createComment(payload.fileId, action.payload.content);
@@ -523,6 +403,11 @@ function refusal(error: unknown): string {
   return `Google Drive refused this comment [http=${error.status}].`;
 }
 
+/** Said when Drive leaves open whether a send posted. */
+const UNCONFIRMED_SEND = "Google Drive did not confirm whether this was posted, and it may have " +
+  "been. Approving it again first checks the file's comments, so it is not posted twice; " +
+  "rejecting it leaves anything already posted on the file.";
+
 /**
  * Posts one approved write, looking first for what an earlier send of it may have posted. A
  * send's marker is dropped here only once no send of the write is in doubt: Google refused it
@@ -531,62 +416,25 @@ function refusal(error: unknown): string {
  * action's record is settled: until then a retry must find it and look, never send.
  * @returns The ID Drive gave what was posted.
  */
-async function post(
-  host: DriveCommentsHost, id: number, action: DriveCommentAction,
-): Promise<string> {
-  let log = logger.with({ actionId: id, actionKind: action.kind, fileId: action.payload.fileId });
-  let prior = host.attempts.get(id);
-  if (prior) {
-    // Judged before the look: one taken while the window is open proves nothing by finding nothing.
-    let conclusive = windowClosed(prior);
-    let found = await findPosted(host, action, prior);
-    if (found !== undefined) {
-      log.info("found a Drive comment an earlier send posted", {
-        event: "drive.comments.reconciled", commentId: found, outcome: "found",
-      });
-      return found;
-    }
-    if (!conclusive) throw notShownYet(prior);
-    // The window closed with nothing found: that send posted nothing, so none is in doubt.
-    host.attempts.delete(id);
-  }
-
-  let comment = await requireStillAllowed(host, action);
-  let at = Date.now();
-  // A reply already there, such as an earlier resolve of a since reopened comment, is not this
-  // send's. Comments are not listed first: taking an identical one for this send drops a duplicate.
-  let existing = action.kind === "createComment" || !comment ? [] : comment.replies
-    .filter(reply => mineFrom(reply, at - CLOCK_SKEW_MS) && looksSent(action, reply))
-    .map(reply => reply.id);
-  host.attempts.put(id, { at, ...(existing.length ? { existing } : {}) });
-  try {
-    let created = await send(host.api, action);
-    log.info("posted a Drive comment", {
-      event: "drive.comments.posted", commentId: created.id, outcome: "posted",
-    });
-    return created.id;
-  } catch (error) {
-    let failure = commentWriteFailure(error);
-    log.warn("Drive comment send failed", {
-      event: "drive.comments.send.failed", outcome: failure, error,
-      ...(error instanceof DriveApiRequestError
-        ? { httpStatus: error.status, ...(error.reason ? { providerReasons: [error.reason] } : {}) }
-        : {}),
-    });
-    if (failure === "unknown") {
-      throw new Error("Google Drive did not confirm whether this was posted, and it may have " +
-        "been. Approving it again first checks the file's comments, so it is not posted twice; " +
-        "rejecting it leaves anything already posted on the file.", { cause: error });
-    }
-    host.attempts.delete(id);
-    if (failure === "rateLimited") {
-      throw new Error("Google Drive is limiting requests from this account. Approve it again in " +
-        "a minute.", { cause: error });
-    }
-    // The token lacks the scope, which allowing changes again lifts, as when the account says so.
-    if (isInsufficientScope(error)) throw new Error(WRITES_GRANT_MISSING, { cause: error });
-    throw new ActionApplyError(refusal(error));
-  }
+function post(host: DriveWritesHost, id: number, action: DriveCommentAction): Promise<string> {
+  return sendOnce<string>(host, id, {
+    log: logger.with({ actionId: id, actionKind: action.kind, fileId: action.payload.fileId }),
+    events: "drive.comments",
+    applied: { event: "posted", outcome: "posted" },
+    look: async prior => {
+      // Judged before the look: one taken while the window is open proves nothing by finding
+      // nothing.
+      let conclusive = windowClosed(prior);
+      let found = await findPosted(host, action, prior);
+      return found === undefined ? { conclusive, retry: notShownYet(prior) } : { found };
+    },
+    check: () => requireStillAllowed(host, action),
+    send: async () => (await send(host.api, action)).id,
+    repeatable: false,
+    refusal,
+    unconfirmed: UNCONFIRMED_SEND,
+    logFields: commentId => ({ commentId }),
+  });
 }
 
 function fileLine(builder: ActionDescriptionBuilder, payload: CommentTargetPayload): void {
@@ -617,8 +465,10 @@ function parentLines(
 
 const EMAILED = "Google emails the file's owner about new comments.";
 
-/** The declared Drive comment writes. */
-export const DRIVE_COMMENT_ACTIONS = defineActions<DriveCommentsHost, DriveCommentActions>({
+/** The declared Drive comment writes, which drive-actions.ts combines with the others. */
+export const DRIVE_COMMENT_DEFINITIONS: {
+  [K in keyof DriveCommentActions]: ActionDefinition<DriveCommentActions[K], DriveWritesHost>;
+} = {
   createComment: {
     kind: DRIVE_COMMENTS,
     autoApprovable: true,
@@ -680,29 +530,4 @@ export const DRIVE_COMMENT_ACTIONS = defineActions<DriveCommentsHost, DriveComme
       await post(host, ctx.id, { kind: "resolveComment", payload });
     },
   },
-}, { fence: "none", vendorId: "google" });
-
-/** Where a send's attempt marker is stored, by action ID. */
-export const COMMENT_ATTEMPT_PREFIX = "driveComments:attempt:";
-
-function attemptKey(id: number): string {
-  return `${COMMENT_ATTEMPT_PREFIX}${id}`;
-}
-
-/** The attempt markers of one Drive binding, kept in its Durable Object's storage. */
-export function commentAttempts(kv: DurableObjectStorage["kv"]): DriveCommentsHost["attempts"] & {
-  /** Drops the markers of actions `keep` does not name: none of them can be applied again. */
-  sweep(keep: ReadonlySet<number>): void;
-} {
-  return {
-    get: id => kv.get<CommentAttempt>(attemptKey(id)),
-    put: (id, attempt) => kv.put(attemptKey(id), attempt),
-    delete: id => { kv.delete(attemptKey(id)); },
-    sweep: keep => {
-      for (let [stored] of kv.list({ prefix: COMMENT_ATTEMPT_PREFIX })) {
-        let id = Number(stored.slice(COMMENT_ATTEMPT_PREFIX.length));
-        if (!keep.has(id)) kv.delete(stored);
-      }
-    },
-  };
-}
+};

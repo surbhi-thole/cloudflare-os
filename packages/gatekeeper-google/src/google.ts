@@ -42,20 +42,34 @@ import {
   type DocTabSnapshot, type EditableMarkdown,
 } from "./markdown-converter";
 import {
-  DriveApi, DriveApiRequestError, FOLDER_MIME_TYPE, isDriveCommentId, lacksFileContentAccess,
-  MAX_BATCH_FILES,
+  DriveApi, DriveApiRequestError, isDriveCommentId, isInsufficientScope, lacksFileContentAccess,
+  MAX_BATCH_FILES, type DrivePermissionRecord,
 } from "./drive-api";
+import {
+  DRIVE_ACTIONS, type DriveAction, type DriveActions, type DriveQueue,
+} from "./drive-actions";
 import {
   composeComment, composeReply, composeResolve, composeSuggestion, headingLink, locateQuote,
   selectTab,
 } from "./drive-comment-body";
 import {
-  ALREADY_RESOLVED, COMMENT_NOT_FOUND, commentAttempts, commentParent, DRIVE_COMMENT_ACTIONS,
-  isPendingCommentId, overlayPending, PENDING_COMMENT_REFUSED, pendingComment, pendingReply,
-  readLiveComment, shownFileName, toDriveComment, writeRefusal,
-  type CommentTargetPayload, type DriveCommentAction, type DriveCommentActions,
-  type DriveCommentQueue,
+  ALREADY_RESOLVED, COMMENT_NOT_FOUND, commentParent, overlayPending, PENDING_COMMENT_REFUSED,
+  pendingComment, pendingReply, readLiveComment, toDriveComment,
+  type CommentTargetPayload, type DriveCommentActions,
 } from "./drive-comments";
+import {
+  hasPendingMove, MOVE_DESTINATION_WAITING, MOVE_PENDING, MOVE_WAITING,
+} from "./drive-moves";
+import {
+  ACCESS_WAITING_CHANGE, ACCESS_WAITING_REMOVE, CHANGE_PENDING, checkAccessName, checkShare,
+  hasPendingChange, hasPendingShare, overlayPendingAccess, pendingAccess, pendingAccessRefusal,
+  planShare, planUnshare, planUpdate, readPermissions, SHARE_PENDING, toAccessEntries,
+} from "./drive-sharing";
+import {
+  actorFence, driveAccessCap, isPendingId, readOnlyRefusal, shownFileName, writeAttempts,
+  writeRefusal, WRITE_CONNECTION_REFUSED, WRITES_GRANT_MISSING, type DriveActor,
+  type DriveWriteTargetPayload, type QueuedWrite,
+} from "./drive-writes";
 import { CONVERSION_FAILED, pdfToText, type PdfConverter } from "./drive-pdf";
 import { downloadableFile, exactRange, fileReadRange, FILE_CHANGED } from "./drive-file-read";
 import type { AiFetcher } from "./workers-ai-markdown";
@@ -68,13 +82,15 @@ import {
 import { outsideScope, readFolderRoot, type FolderLocation } from "./drive-folder-scope";
 import {
   DriveFolderSessionCore, DriveSessionCore, driveModifiedTime,
-  GOOGLE_DOC_MIME_TYPE, GOOGLE_SHEET_MIME_TYPE, GOOGLE_SLIDES_MIME_TYPE, PDF_MIME_TYPE,
-  requireDriveBindingScope, type CommentTarget, type DriveBindingScope, type DriveCore,
+  GOOGLE_DOC_MIME_TYPE, GOOGLE_SHEET_MIME_TYPE, GOOGLE_SLIDES_MIME_TYPE, MOVE_INTO_ITSELF,
+  MOVE_SINGLE_FILE, PDF_MIME_TYPE,
+  requireDriveBindingScope, type DriveBindingScope, type DriveCore, type DriveWriteTarget,
   type NativeObservation, type NativeRead,
 } from "./drive-session";
 import type {
-  DriveComment, DriveCommentOptions, DriveCommentReply, DriveEntry, DriveFileBytes,
-  DriveFileReadOptions, DriveListOptions, DrivePdfText, DriveSessionSearchQuery,
+  DriveAccess, DriveComment, DriveCommentOptions, DriveCommentReply, DriveEntry, DriveFileBytes,
+  DriveFileReadOptions, DriveGrantee, DriveListOptions, DrivePdfText, DriveSessionSearchQuery,
+  DriveShareOptions, DriveShareRole,
   DriveSuggestEditOptions, GoogleDriveFolderSession, GoogleDriveSession,
 } from "./drive-types";
 import { ChatApi, ChatApiError } from "./chat-api";
@@ -205,6 +221,9 @@ const VENDOR_ID = "google";
 const logger = obsContext.createLogger({
   component: "gatekeeper.google", vendorId: VENDOR_ID,
 });
+const driveLogger = obsContext.createLogger({
+  component: "gatekeeper.google.drive", vendorId: VENDOR_ID,
+});
 
 const NONCE_BYTES = 32;
 
@@ -245,6 +264,8 @@ type Env = Cloudflare.Env & GoogleOAuthEnv & PushHooksEnv & {
   // OAuth app credentials (wrangler secrets / .dev.vars); not in wrangler.jsonc.
   CLIENT_ID?: string;
   CLIENT_SECRET?: string;
+  // `write` (the default) or `read`: the most this deployment lets a Drive connection do.
+  GOOGLE_DRIVE_ACCESS?: string;
 }
 
 // =======================================================================================
@@ -621,8 +642,12 @@ export class UserAccount extends DurableObject<Env> {
     scopes: string[],
   } | null> {
     let oauthNonce = generateNonce();
+    // Where the deployment keeps Google Drive read-only, no consent asks Google for the scope
+    // Drive writes need. The grant stays in the attempt, so it is asked for again once they are
+    // allowed.
+    let withheld = driveAccessCap(this.env) === "write" ? [] : [DRIVE_WRITES_GRANT];
     return beginStoredOAuthFlow(
-        this.ctx.storage.kv, initiationNonce, oauthNonce, oauthRedirectUri, Date.now());
+        this.ctx.storage.kv, initiationNonce, oauthNonce, oauthRedirectUri, Date.now(), withheld);
   }
 
   consumeOAuthNonce(oauthNonce: string): boolean {
@@ -1102,6 +1127,11 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
           case "driveFolder": scope = { kind: "folder", folderId: target.folderId }; break;
           default: scope = { kind: "file", fileId: target.fileId };
         }
+        // A binding's level is fixed in its props, so one this deployment does not allow is refused
+        // here and not narrowed: narrowed, it would stay read-only after the setting was lifted.
+        if (target.access === "write" && driveAccessCap(this.env) !== "write") {
+          throw new Error(WRITE_CONNECTION_REFUSED);
+        }
         let props: GoogleDriveGatekeeperImplProps = {
           userObjectId, scope, ...(target.access === "write" ? { access: "write" } : {}),
         };
@@ -1169,7 +1199,8 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
         groupedWith === GOOGLE_DRIVE_RESOURCE.urlPattern) {
       return {
         iframeHtml: DRIVE_CONFIGURATOR_HTML,
-        ui: new RpcStub(new DriveConfiguratorUI(getToken, holds)),
+        ui: new RpcStub(
+          new DriveConfiguratorUI(getToken, holds, driveAccessCap(this.env) === "write")),
       };
     }
 
@@ -3384,6 +3415,13 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
 // Google Drive Gatekeeper
 // =======================================================================================
 
+/** Said of a write whose earlier send is in doubt while another Google account is connected. */
+const SEND_IN_DOUBT_OTHER_ACCOUNT =
+  "An earlier attempt at this may already have changed the file, and it was made as another " +
+  "Google account than the one connected now, so it can't be checked or finished as this one. " +
+  "Reconnect as the account that queued it and approve it again, which first checks the file. " +
+  "Or check the file on Google Drive, then reject this to clear it.";
+
 export type GoogleDriveGatekeeperImplProps = {
   userObjectId: string;
   scope: DriveBindingScope;
@@ -3397,14 +3435,25 @@ export class GoogleDriveGatekeeperImpl
     implements Gatekeeper<GoogleDriveSession> {
   #tokens = new AccessTokenCache(opts => this.#account().getAccessToken(opts));
   #api = new DriveApi(opts => this.#getAccessToken(opts));
-  #journal = new ActionJournal<DriveCommentAction>(this.ctx.storage.kv, { namespace: "drive" });
-  #attempts = commentAttempts(this.ctx.storage.kv);
-  #actions = DRIVE_COMMENT_ACTIONS.bind(this.#journal, {
-    api: this.#api,
-    scope: () => this.#scope,
-    writeRefusal: () => this.#writeRefusal(),
+  #journal = new ActionJournal<DriveAction>(this.ctx.storage.kv, { namespace: "drive" });
+  #attempts = writeAttempts(this.ctx.storage.kv);
+  /**
+   * The one token an approval of a sharing change or a move sends everything under, while that
+   * approval runs (see applyAction()). Approvals run one at a time, behind #reads.
+   */
+  #approvalToken: string | undefined;
+  /**
+   * The Drive client the action handlers use. While an approval's token is set it answers that
+   * token to every request, a refresh or a reload asked for after a 401 or a 403 included, so
+   * nothing is sent a second time under other credentials. Otherwise it is the connection's own
+   * provider, under which a comment is applied.
+   */
+  #applyApi = new DriveApi(async opts => this.#approvalToken ?? this.#getAccessToken(opts));
+  #host = {
+    api: this.#applyApi, scope: () => this.#scope, writeRefusal: () => this.#writeRefusal(),
     attempts: this.#attempts,
-  });
+  };
+  #actions = DRIVE_ACTIONS.bind(this.#journal, this.#host);
   #reads = new ReadGate();
 
   #account() {
@@ -3412,9 +3461,12 @@ export class GoogleDriveGatekeeperImpl
       this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
   }
 
-  /** Whether the connection was made read and write. Anything else in its props is read-only. */
+  /**
+   * Whether the connection may make changes: it was made read and write, and the deployment lets
+   * Drive connections write. Anything else is read-only in every respect.
+   */
   get #writes(): boolean {
-    return this.ctx.props.access === "write";
+    return this.ctx.props.access === "write" && driveAccessCap(this.env) === "write";
   }
 
   /**
@@ -3435,7 +3487,8 @@ export class GoogleDriveGatekeeperImpl
   /** Why this binding cannot make changes now, if it cannot: asked at queue and at apply. */
   #writeRefusal(): Promise<string | undefined> {
     return writeRefusal({
-      access: this.ctx.props.access, scope: this.#scope, holdsGrant: () => this.#holdsWritesGrant(),
+      deployment: driveAccessCap(this.env), access: this.ctx.props.access, scope: this.#scope,
+      holdsGrant: () => this.#holdsWritesGrant(),
     });
   }
 
@@ -3443,18 +3496,42 @@ export class GoogleDriveGatekeeperImpl
     return this.#tokens.get(opts);
   }
 
+  /** The Google account `api`'s token is for, asked of Drive. */
+  async #identity(api: DriveApi): Promise<DriveActor> {
+    try {
+      return await api.getAccountIdentity();
+    } catch (error) {
+      // A token with no Drive scope: the account does not hold the grant, and that is what to say.
+      if (isInsufficientScope(error)) throw new Error(WRITES_GRANT_MISSING, { cause: error });
+      throw error;
+    }
+  }
+
+  /**
+   * The Google account this connection acts as now, for a call that queues a write. This object
+   * keeps the token it last used until that token nears expiry, and a reconnect does not revoke
+   * the one before it, so without the reload a connection switched to another Google account
+   * would answer as the first for up to a token's lifetime, and a write would be staged under it.
+   */
+  async #actor(): Promise<DriveActor> {
+    // Replaces the kept token with the account's stored one, minting nothing while that is good.
+    await this.#getAccessToken({ reloadStored: true });
+    return this.#identity(this.#api);
+  }
+
   async describe(): Promise<ResourceDescription> {
     let scope = this.#scope;
     let write = this.#writes;
-    let level = write ? "Read and write" : "Read-only";
-    let comments = write ? "read and queue comments" : "read comments";
     // The title is where a connection's level is said to people and to the agent.
     let titled = (title: string) => write ? `${title} (read and write)` : title;
     if (scope.kind === "account") {
+      let reads = "find files anywhere this Google account can read in Drive, read native Google Docs, Sheets and Slides, read PDFs' text with readPdf() and any other file's bytes with readFile()";
       return {
         url: GOOGLE_DRIVE_RESOURCE.urlPattern,
         title: titled("Google Drive Account"),
-        snippet: `${level}: find files anywhere this Google account can read in Drive, read native Google Docs, Sheets and Slides, read PDFs' text with readPdf() and any other file's bytes with readFile(), and ${comments}`,
+        snippet: write
+          ? `Read and write: ${reads}, read and queue comments, change who files are shared with, and move files`
+          : `Read-only: ${reads}, and read comments`,
         suggestedBindingName: "GOOGLE_DRIVE",
         tsType: write ? "GoogleDriveSession" : "GoogleDriveReadSession",
       };
@@ -3464,11 +3541,14 @@ export class GoogleDriveGatekeeperImpl
       // Validated here too, so a hand-built resource URL fails at connect rather than minting a
       // presentable binding whose every call then refuses.
       let folder = await readFolderRoot(scope.folderId, id => api.getFile(id));
+      let reads = "list and search direct children, navigate child folders, read native Google Docs, Sheets and Slides, read PDFs' text with readPdf() and any other file's bytes with readFile()";
       return {
         // The natural browser URL, not the internal `_resource` selector the grant is keyed on.
         url: `https://drive.google.com/drive/folders/${encodeURIComponent(scope.folderId)}`,
         title: titled(folder.name),
-        snippet: `${level}: list and search direct children, navigate child folders, read native Google Docs, Sheets and Slides, read PDFs' text with readPdf() and any other file's bytes with readFile(), and ${comments} on direct children in Drive folder "${folder.name}"`,
+        snippet: write
+          ? `Read and write: ${reads}, read and queue comments on direct children, change who they and the folder are shared with, and move them within Drive folder "${folder.name}"`
+          : `Read-only: ${reads}, and read comments on direct children in Drive folder "${folder.name}"`,
         suggestedBindingName: "GOOGLE_DRIVE_FOLDER",
         tsType: write ? "GoogleDriveFolderSession" : "GoogleDriveFolderReadSession",
       };
@@ -3478,7 +3558,7 @@ export class GoogleDriveGatekeeperImpl
       url: `https://drive.google.com/file/d/${encodeURIComponent(scope.fileId)}/view`,
       title: titled(file.name),
       snippet: write
-        ? `Read and write: read metadata and, when native, Google Doc, Sheet or Slides content, with readPdf() a PDF's text, or with readFile() the bytes of any other file, from Drive file "${file.name}", and read and queue comments on it`
+        ? `Read and write: read metadata and, when native, Google Doc, Sheet or Slides content, with readPdf() a PDF's text, or with readFile() the bytes of any other file, from Drive file "${file.name}", read and queue comments on it, and change who it is shared with`
         : `Read-only: read metadata and, when native, Google Doc, Sheet or Slides content, with readPdf() a PDF's text, or with readFile() the bytes of any other file, and comments, from Drive file "${file.name}"`,
       suggestedBindingName: "GOOGLE_DRIVE_FILE",
       tsType: write ? "GoogleDriveFileSession" : "GoogleDriveReadSession",
@@ -3503,11 +3583,17 @@ export class GoogleDriveGatekeeperImpl
     let ai = this.env.AI as unknown as AiFetcher | undefined;
     let gatewayId = this.env.CF_AI_GATEWAY;
     let convertPdf: PdfConverter | undefined = ai && (pdf => pdfToText(ai, gatewayId, pdf));
-    let comments: DriveCommentQueue = {
+    let writes: DriveQueue = {
       access: this.#writes ? "write" : "read",
       writeRefusal: () => this.#writeRefusal(),
-      submit: (queue, kind, payload) => this.#actions.submit(queue, kind, payload),
+      actor: () => this.#actor(),
+      submit: (queue, kind, payload, fence) =>
+        this.#actions.submit(queue, kind, payload, fence ? { fence } : undefined),
       undecided: read => this.#reads.read(() => read(this.#journal.listUndecided())),
+      // A claim an approval left behind is taken up by the next one (see #adoptOrphanedClaim()),
+      // so it waits as much as an undecided write does. Reads wait behind a running approval, so
+      // none sees the claim that approval holds.
+      waiting: read => this.#reads.read(() => read(this.#journal.listPending())),
     };
     return new GoogleDriveSessionImpl(
       this.#api,
@@ -3517,26 +3603,58 @@ export class GoogleDriveGatekeeperImpl
       convertPdf,
       this.#scope,
       approvalQueue.dup(),
-      comments,
+      writes,
     );
   }
 
   /**
    * Applies a write, and then drops its attempt marker. The marker outlives the send it records
    * until the action's record is settled, so that a retry of an apply that ended in between finds
-   * it and looks for what was posted.
+   * it and looks for what that send made.
    */
   applyAction(actionId: number, _cache: RpcStub<GitCache>): Promise<void> {
     return this.#reads.resolve(async () => {
-      this.#adoptOrphanedClaim(actionId);
-      await this.#actions.apply(actionId);
-      this.#attempts.delete(actionId);
+      // A sharing change or a move was staged under the Google account that queued it. Only a
+      // record still to be applied needs the account asked: the kit answers an applied or failed
+      // one from what it stored, and that must not depend on Google answering.
+      let record = this.#journal.get(actionId);
+      let settled = record === undefined || record.state === "failed" ||
+        this.#journal.wasApplied(actionId);
+      if (!record?.fence || settled) {
+        this.#adoptOrphanedClaim(actionId);
+        await this.#actions.apply(actionId);
+        this.#attempts.delete(actionId);
+        return;
+      }
+      // Everything this approval asks of Drive goes out under the token the account stores now:
+      // the identity read, the look, the checks and the change. So the account that passes the
+      // fence is the one the change is made as, whatever is connected meanwhile, and a request
+      // Google refuses is never sent again under other credentials.
+      this.#approvalToken = await this.#getAccessToken({ reloadStored: true });
+      try {
+        let actor = await this.#identity(this.#applyApi);
+        if (record.fence.generation !== actor.permissionId &&
+            this.#attempts.get(actionId) !== undefined) {
+          // The kit would fail it for good and say to submit again. An earlier send may have
+          // landed, and the account that can check it may be connected again: leave it as it is.
+          driveLogger.warn("a Drive write with a send in doubt met another Google account", {
+            event: "drive.apply.account.changed", actionId, actionKind: record.action.kind,
+            outcome: "unknown",
+          });
+          throw new Error(SEND_IN_DOUBT_OTHER_ACCOUNT);
+        }
+        this.#adoptOrphanedClaim(actionId);
+        await this.#actions.apply(actionId, { generation: actor.permissionId });
+        this.#attempts.delete(actionId);
+      } finally {
+        this.#approvalToken = undefined;
+      }
     });
   }
 
   /**
-   * Withdraws a write, whatever an earlier send of it did: a comment that send posted stays on the
-   * file, and nothing applies the action again, so its attempt marker goes with it.
+   * Withdraws a write, whatever an earlier send of it did: what that send made stays on the file,
+   * and nothing applies the action again, so its attempt marker goes with it.
    */
   rejectAction(actionId: number): Promise<void> {
     return this.#reads.resolve(async () => {
@@ -3546,14 +3664,14 @@ export class GoogleDriveGatekeeperImpl
   }
 
   revertAction(_action: number): Promise<void> {
-    throw new Error("Google Drive comments cannot be reverted automatically.");
+    throw new Error("Google Drive changes cannot be reverted automatically.");
   }
 
   /**
    * Hands a claim an earlier apply left behind back to the action set as undecided, rather than
    * let it be failed as of unknown outcome: the send's attempt marker decides instead. With one,
-   * applying looks for what the send posted before anything is sent again. Without one, no send
-   * of the write is in doubt: none was made, or each one made is known to have posted nothing. A
+   * applying looks for what the send made before anything is sent again. Without one, no send of
+   * the write is in doubt: none was made, or each one made is known to have changed nothing. A
    * marker is kept until its action is applied or rejected so that this holds. Resolutions run
    * one at a time behind the read gate, so a claim found here is never one this activation holds.
    */
@@ -3563,12 +3681,13 @@ export class GoogleDriveGatekeeperImpl
 
   // Observers: every read reports the Drive units it depends on as subresources (see
   // file-subresources.ts), which the Workshop checks through verifyObserverAccess(): each file
-  // whose metadata or comments it returned, each file whose PDF text or bytes it returned (as
-  // content, which needs leave to download), each folder it listed, and each native file whose
-  // content it read, Docs, Sheets and Slides included. A read whose answer is relative to the
-  // connected account (an account binding's empty search, a folder it cannot list, a file it
-  // cannot see, or a file it cannot comment on) reports `[]`; a folder binding's search reports
-  // its folders even when empty. Account-binding invisible-file 403/404 probes return one generic
+  // whose metadata, comments or sharing it returned, each file whose PDF text or bytes it returned
+  // (as content, which needs leave to download), each folder it listed, and each native file
+  // whose content it read, Docs, Sheets and Slides included. A read whose answer is relative to
+  // the connected account (an account binding's empty search, a folder it cannot list, a file it
+  // cannot see, comment on or share, the top level of its own My Drive named as a sharing
+  // target, or a move it may not make) reports `[]`; a folder binding's search reports its
+  // folders even when empty. Account-binding invisible-file 403/404 probes return one generic
   // error without Google's per-file reason. The tracker no longer records what reads reveal. It
   // keeps what addObserver() still enforces: a Drive grant, the bound folder or file (seeded
   // below), the units reads recorded before they reported subresources, and the admission fence
@@ -3721,7 +3840,7 @@ class GoogleDocReadSessionImpl extends RpcTarget implements GoogleDocReadSession
 
 /** Refuses a comment ID that names a queued write, or is not a comment ID at all. */
 function requirePostedCommentId(commentId: string): void {
-  if (isPendingCommentId(commentId)) throw new Error(PENDING_COMMENT_REFUSED);
+  if (isPendingId(commentId)) throw new Error(PENDING_COMMENT_REFUSED);
   if (!isDriveCommentId(commentId)) throw new Error("Not a Google Drive comment ID.");
 }
 
@@ -3747,6 +3866,17 @@ const COMMENTS_ACCESS_MISSING =
   "This Google account was connected before Drive bindings could read file content. Reconnect " +
   "it in Workshop to read comments.";
 
+/**
+ * Said before a write refusal that answers a listing: each speaks of changes, and none was asked
+ * for.
+ */
+const LISTING_TAKES_WRITES = "Seeing who a file is shared with takes what changing it takes.";
+
+/** Said before the read-only refusal of an all-of-Drive binding, which names a single-file URL. */
+const MOVE_NEEDS_A_FOLDER =
+  "Moving takes a folder or all-of-Drive connection: the single-file connection named below " +
+  "cannot move a file.";
+
 /** Drive RPC session implementation, exported for workerd contract coverage. */
 @validateRpc()
 export class GoogleDriveSessionImpl extends RpcTarget
@@ -3762,7 +3892,7 @@ export class GoogleDriveSessionImpl extends RpcTarget
   /** Set exactly when the scope is a folder, so no core has to be built to learn which it is. */
   #location?: FolderLocation;
   #approvalQueue: RpcStub<ApprovalQueue>;
-  #comments: DriveCommentQueue;
+  #writes: DriveQueue;
 
   constructor(
     driveApi: DriveApi,
@@ -3772,7 +3902,7 @@ export class GoogleDriveSessionImpl extends RpcTarget
     convertPdf: PdfConverter | undefined,
     scope: DriveBindingScope,
     approvalQueue: RpcStub<ApprovalQueue>,
-    comments: DriveCommentQueue,
+    writes: DriveQueue,
     location?: FolderLocation,
   ) {
     super();
@@ -3786,7 +3916,7 @@ export class GoogleDriveSessionImpl extends RpcTarget
       ? location ?? {folderIds: [scope.folderId]}
       : undefined;
     this.#approvalQueue = approvalQueue;
-    this.#comments = comments;
+    this.#writes = writes;
     this.#core = this.#coreFor(this.#approvalQueue);
   }
 
@@ -3816,7 +3946,7 @@ export class GoogleDriveSessionImpl extends RpcTarget
       let location = await (core as DriveFolderSessionCore).openFolder(folderId);
       return new GoogleDriveSessionImpl(
         this.#driveApi, this.#docsApi, this.#sheetsApi, this.#slidesApi, this.#convertPdf,
-        this.#scope, queue, this.#comments, location,
+        this.#scope, queue, this.#writes, location,
       );
     });
   }
@@ -3934,7 +4064,7 @@ export class GoogleDriveSessionImpl extends RpcTarget
     return this.#withQueue(async (queue, core) => {
       let { fileId: id } = await core.commentTarget(fileId);
       await core.requireCommentable(id);
-      let pager = core.commentPager(id, fetch => this.#comments.undecided(async pending => {
+      let pager = core.commentPager(id, fetch => this.#writes.undecided(async pending => {
         let { comments, nextPageToken } = await fetch().catch((error: unknown) => {
           throw lacksFileContentAccess(error) ? new Error(COMMENTS_ACCESS_MISSING) : error;
         });
@@ -4014,34 +4144,229 @@ export class GoogleDriveSessionImpl extends RpcTarget
     return pendingReply(queued.id, { kind: "resolveComment", payload: queued.payload });
   }
 
-  /** Refuses a write this binding may not make: it is read-only, or its account does not allow changes. */
+  async listAccess(fileId: string): Promise<DriveAccess[]> {
+    // A listing is a read, and each refusal speaks of changes, so it is said what the two share.
+    let refused = await this.#writes.writeRefusal();
+    if (refused !== undefined) throw new Error(`${LISTING_TAKES_WRITES} ${refused}`);
+    let actor = await this.#writes.actor();
+    let { target } = await this.#sharing(fileId);
+    let id = target.fileId;
+    let entries = await this.#writes.undecided(async pending => overlayPendingAccess(
+      id, toAccessEntries(await this.#permissions(target), actor.permissionId), pending));
+    await this.#core.authorizeAccessList(target, entries.length);
+    return entries;
+  }
+
+  async share(
+    fileId: string, grantee: DriveGrantee, role: DriveShareRole, options?: DriveShareOptions,
+  ): Promise<DriveAccess> {
+    await this.#requireWritable();
+    let checked = checkShare(grantee, options);
+    let actor = await this.#writes.actor();
+    let { target, base } = await this.#sharing(fileId);
+    await this.#refuseBehindMove(target);
+    let id = target.fileId;
+    await this.#refuseQueued(pending =>
+      hasPendingShare(id, checked.grantee, pending) ? SHARE_PENDING : undefined);
+    let permissions = await this.#permissions(target);
+    // Asked again with the list in hand, so that no refusal names access a listing leaves out.
+    let plan = await this.#writes.undecided(async pending =>
+      planShare(id, permissions, actor, checked.grantee, role, pending));
+    let payload = { ...base, ...checked, role, ...plan };
+    let actionId = await this.#writes.submit(
+      this.#approvalQueue, "createPermission", payload, actorFence(actor));
+    return pendingAccess(actionId, payload);
+  }
+
+  async updateAccess(
+    fileId: string, access: string | DriveGrantee, role: DriveShareRole,
+  ): Promise<DriveAccess> {
+    let { payload, actor, permissions } = await this.#prepareChange(
+      fileId, access, "change", (listed, as, named) => planUpdate(listed, as, named, role));
+    // The entry a listing shows for it while it waits: the one given on the file, at the new role.
+    let entry = toAccessEntries(permissions, actor.permissionId)
+      .find(listed => !listed.inherited && listed.id === payload.permissionId);
+    if (!entry) throw new Error("That access was not found on this file.");
+    await this.#writes.submit(
+      this.#approvalQueue, "updatePermission", payload, actorFence(actor));
+    return { ...entry, role, pending: true };
+  }
+
+  async unshare(fileId: string, access: string | DriveGrantee): Promise<void> {
+    let { payload, actor } = await this.#prepareChange(fileId, access, "remove", planUnshare);
+    await this.#writes.submit(
+      this.#approvalQueue, "deletePermission", payload, actorFence(actor));
+  }
+
+  async move(fileId: string, folderId: string): Promise<void> {
+    // Said before the write refusal, whose URL on a read-only file binding could not move either.
+    if (this.#scope.kind === "file") throw new Error(MOVE_SINGLE_FILE);
+    let refused = await this.#writes.writeRefusal();
+    if (refused !== undefined) {
+      // Only an all-of-Drive binding's read-only refusal names a connection that cannot move.
+      throw new Error(refused === readOnlyRefusal({ kind: "account" })
+        ? `${MOVE_NEEDS_A_FOLDER} ${refused}` : refused);
+    }
+    if (folderId === fileId) throw new Error(MOVE_INTO_ITSELF);
+    let actor = await this.#writes.actor();
+    let target = await this.#core.moveTarget(fileId, folderId);
+    await this.#refuseQueued(pending => {
+      if (hasPendingMove([target.fileId], pending)) return MOVE_PENDING;
+      // A folder binding proves the move again at approval along the saved path, and the
+      // destination as a child of the source, so a move of either would leave it unprovable.
+      if (!target.folderIds) return undefined;
+      if (hasPendingMove(target.folderIds, pending)) return MOVE_WAITING;
+      return hasPendingMove([target.toFolderId], pending) ? MOVE_DESTINATION_WAITING : undefined;
+    });
+    await this.#writes.submit(this.#approvalQueue, "moveFile", {
+      fileId: target.fileId,
+      fileName: shownFileName(target.name),
+      ...(target.isFolder ? { isFolder: true as const } : {}),
+      fromFolderId: target.fromFolderId,
+      toFolderId: target.toFolderId,
+      ...(target.toName === undefined ? {} : { toName: shownFileName(target.toName) }),
+      ...(target.fromName === undefined ? {} : { fromName: shownFileName(target.fromName) }),
+      ...(target.fromMyDrive ? { fromMyDrive: true as const } : {}),
+      ...(target.toMyDrive ? { toMyDrive: true as const } : {}),
+      ...(target.folderIds ? { folderIds: target.folderIds } : {}),
+    }, actorFence(actor));
+  }
+
+  /**
+   * Refuses a write this binding may not make, with the reason `writeRefusal()` gives: the
+   * deployment keeps Google Drive read-only, the binding is read-only, or its account does not
+   * allow changes.
+   */
   async #requireWritable(): Promise<void> {
-    let refused = await this.#comments.writeRefusal();
+    let refused = await this.#writes.writeRefusal();
     if (refused !== undefined) throw new Error(refused);
   }
 
   /**
-   * Checks and queues one comment write: the file is in scope, is not a folder, and the connected
-   * account can comment on it, all before `prepare` builds the payload, and nothing is queued
-   * until it has.
+   * Throws the refusal `ask` answers from the writes this binding has waiting, if it answers one:
+   * those still to be decided, and those an interrupted approval left to be applied by the next.
+   * The read gate is held across no request.
+   */
+  async #refuseQueued(ask: (pending: readonly QueuedWrite[]) => string | undefined): Promise<void> {
+    let refused = await this.#writes.waiting(async pending => ask(pending));
+    if (refused !== undefined) throw new Error(refused);
+  }
+
+  /** The scope proof, the sharing check and the base payload every sharing call shares. */
+  async #sharing(fileId: string): Promise<{
+    target: DriveWriteTarget; base: DriveWriteTargetPayload & { isFolder?: true };
+  }> {
+    let core = this.#core;
+    let target = await core.sharingTarget(fileId);
+    await core.requireShareable(target.fileId);
+    return {
+      target,
+      base: {
+        fileId: target.fileId,
+        fileName: shownFileName(target.name),
+        ...(target.folderIds ? { folderIds: target.folderIds } : {}),
+        ...(target.self ? { self: true as const } : {}),
+        ...(target.isFolder ? { isFolder: true as const } : {}),
+      },
+    };
+  }
+
+  /**
+   * The permissions of a sharing target, read after its scope proof. A folder binding proves the
+   * target again after the read, as it does after every other read of a child: a file moved out
+   * of the folder meanwhile lists the sharing of where it went, which this binding does not reach.
+   */
+  async #permissions(target: DriveWriteTarget): Promise<DrivePermissionRecord[]> {
+    let permissions = await readPermissions(this.#driveApi, target.fileId);
+    await this.#core.revalidateSharingTarget(target);
+    return permissions;
+  }
+
+  /**
+   * Refuses a write on a folder binding while a move waits for anything its proof at approval
+   * rests on: its file, or a folder of the saved path to it.
+   */
+  async #refuseBehindMove(target: { fileId: string; folderIds?: readonly string[] }): Promise<void> {
+    // An account or file binding proves no path.
+    let { fileId, folderIds } = target;
+    if (!folderIds) return;
+    await this.#refuseQueued(pending =>
+      hasPendingMove([...folderIds, fileId], pending) ? MOVE_WAITING : undefined);
+  }
+
+  /** Access to `fileId` named by a string or a grantee, checked before Google is asked anything. */
+  async #namedAccess(
+    fileId: string, access: string | DriveGrantee, call: "change" | "remove",
+  ): Promise<string | DriveGrantee> {
+    if (typeof access === "string" && isPendingId(access)) {
+      throw new Error(await this.#writes.undecided(
+        async pending => pendingAccessRefusal(fileId, access, pending, call)));
+    }
+    return checkAccessName(access);
+  }
+
+  /**
+   * Everything a role change and a removal do before they are queued: the write refusal, the
+   * access named, the account's identity, the scope proof and the sharing check, what this binding
+   * already has waiting, and the file's permissions, which `plan` holds the request against.
+   */
+  async #prepareChange<P extends { permissionId: string }>(
+    fileId: string, access: string | DriveGrantee, call: "change" | "remove",
+    plan: (
+      permissions: DrivePermissionRecord[], actor: DriveActor, access: string | DriveGrantee,
+    ) => P,
+  ): Promise<{
+    payload: DriveWriteTargetPayload & { isFolder?: true } & P;
+    actor: DriveActor;
+    permissions: DrivePermissionRecord[];
+  }> {
+    await this.#requireWritable();
+    let named = await this.#namedAccess(fileId, access, call);
+    let actor = await this.#writes.actor();
+    let { target, base } = await this.#sharing(fileId);
+    await this.#refuseBehindMove(target);
+    let id = target.fileId;
+    await this.#refuseQueued(pending => {
+      if (typeof named === "string") {
+        return hasPendingChange(id, named, pending) ? CHANGE_PENDING : undefined;
+      }
+      // Access that is not given yet takes no change: the user withdraws it by rejecting it.
+      if (!hasPendingShare(id, named, pending)) return undefined;
+      return call === "change" ? ACCESS_WAITING_CHANGE : ACCESS_WAITING_REMOVE;
+    });
+    let permissions = await this.#permissions(target);
+    let planned = plan(permissions, actor, named);
+    if (typeof named !== "string") {
+      // A grantee names its access only once the list is read.
+      await this.#refuseQueued(pending =>
+        hasPendingChange(id, planned.permissionId, pending) ? CHANGE_PENDING : undefined);
+    }
+    return { payload: { ...base, ...planned }, actor, permissions };
+  }
+
+  /**
+   * Checks and queues one comment write: the file is in scope and is not a folder, the connected
+   * account can comment on it and no move waits for it, all before `prepare` builds the payload,
+   * and nothing is queued until it has.
    */
   async #queueComment<K extends keyof DriveCommentActions>(
     fileId: string,
     kind: K,
-    prepare: (target: CommentTarget, base: CommentTargetPayload) => Promise<DriveCommentActions[K]>,
-  ): Promise<{ id: number; payload: DriveCommentActions[K] }> {
+    prepare: (target: DriveWriteTarget, base: CommentTargetPayload) => Promise<DriveActions[K]>,
+  ): Promise<{ id: number; payload: DriveActions[K] }> {
     let core = this.#core;
     let target = await core.commentTarget(fileId);
     // Before the account is asked whether it can comment: of a folder, Drive says it can.
-    if (target.mimeType === FOLDER_MIME_TYPE) throw new Error(FOLDER_COMMENT_REFUSED);
+    if (target.isFolder) throw new Error(FOLDER_COMMENT_REFUSED);
     await core.requireCommentable(target.fileId);
+    await this.#refuseBehindMove(target);
     let payload = await prepare(target, {
       fileId: target.fileId,
       fileName: shownFileName(target.name),
       ...(target.folderIds ? { folderIds: target.folderIds } : {}),
       queuedAt: new Date().toISOString(),
     });
-    let id = await this.#comments.submit(this.#approvalQueue, kind, payload);
+    let id = await this.#writes.submit(this.#approvalQueue, kind, payload);
     return { id, payload };
   }
 
@@ -4050,7 +4375,7 @@ export class GoogleDriveSessionImpl extends RpcTarget
    * it. Reading the Doc is a content read, authorized as one.
    */
   async #headingLink(
-    target: CommentTarget, quote: string, tabId: string | undefined,
+    target: DriveWriteTarget, quote: string, tabId: string | undefined,
   ): Promise<string | undefined> {
     if (target.mimeType !== GOOGLE_DOC_MIME_TYPE) {
       throw new Error("Quoting and suggested edits work only on Google Docs.");
@@ -4076,7 +4401,7 @@ export class GoogleDriveSessionImpl extends RpcTarget
   #coreFor(queue: RpcStub<ApprovalQueue>): DriveCore {
     let common = {
       api: this.#driveApi,
-      access: this.#comments.access,
+      access: this.#writes.access,
       authorize: (description: ObservationDescription) => queue.authorizeObservation(description),
     };
     if (this.#scope.kind === "folder") {

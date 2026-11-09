@@ -332,7 +332,7 @@ const legacy: SheetCellFormat = { wrap: "OVERFLOW_CELL" };
     for (const phrase of [
       "A read-only binding changes nothing.",
       "request one with `?access=write` added to the resource URL, the narrowest that covers the " +
-        "files to comment on",
+        "files to change",
       "https://drive.google.com/drive/my-drive?access=write",
       "https://drive.google.com/drive/folders/<folderId>?access=write",
       "https://drive.google.com/file/d/<fileId>/view?access=write",
@@ -367,7 +367,8 @@ const legacy: SheetCellFormat = { wrap: "OVERFLOW_CELL" };
     }
     for (const name of [
       "DriveCommentWrites", "DriveCommentOptions", "DriveSuggestEditOptions", "GoogleDriveSession",
-      "GoogleDriveFileSession", "GoogleDriveFolderSession",
+      "GoogleDriveFileSession", "GoogleDriveFolderSession", "DriveSharing", "DriveAccess",
+      "DriveGrantee", "DriveShareRole", "DriveRole", "DriveShareOptions",
     ]) {
       expect(names).not.toContain(name);
     }
@@ -441,9 +442,12 @@ const stamped: DriveCommentReply = { id: "r", author: { displayName: "A", me: fa
       "Replying to a resolved comment reopens it.",
       "A comment that is itself still `pending` takes replies once it is posted, under its Drive ID.",
       "Fails for a comment that is already resolved or that is itself still `pending`.",
-      "anywhere the connected account can reach in Google Drive, plus comment writes.",
-      "the only file its methods accept, plus comment writes on it.",
-      "plus comment writes on the positioned folder's direct children.",
+      "anywhere the connected account can reach in Google Drive, plus comment writes, sharing and " +
+        "moves.",
+      "the only file its methods accept, plus comment writes and sharing on it. It cannot move the " +
+        "file.",
+      "sharing of those children and of the positioned folder itself, and moves within the " +
+        "originally selected folder.",
     ]) {
       expect(writeProse, phrase).toContain(phrase);
     }
@@ -452,8 +456,9 @@ const stamped: DriveCommentReply = { id: "r", author: { displayName: "A", me: fa
     expect(writeProse).not.toContain("Read and write access to");
     expect(topLevelNames(stripTypeModulePrefix(source("drive-types.txt"), DRIVE_TYPES_MODULE_PREFIX)))
       .toEqual([
-        "DriveCommentOptions", "DriveSuggestEditOptions", "DriveCommentWrites", "GoogleDriveSession",
-        "GoogleDriveFileSession", "GoogleDriveFolderSession",
+        "DriveCommentOptions", "DriveSuggestEditOptions", "DriveCommentWrites", "DriveShareRole",
+        "DriveRole", "DriveGrantee", "DriveShareOptions", "DriveAccess", "DriveSharing",
+        "GoogleDriveSession", "GoogleDriveFileSession", "GoogleDriveFolderSession",
       ]);
     expect(duplicates(topLevelNames(driveWriteBundle()))).toEqual([]);
     expect(compileAgentTypes(driveWriteBundle() + `
@@ -479,6 +484,188 @@ drive.comment("file-1", "Why?", { anchor: "kix.1" });
 declare const readOnly: GoogleDriveReadSession;
 // @ts-expect-error A read-only session is not a read and write one.
 const widened: GoogleDriveSession = readOnly;
+`)).toEqual([]);
+  });
+
+  it("declares sharing once, for every read and write Drive session, and moves for two of them", () => {
+    const writeTypes = source("drive-types.d.ts");
+    for (const signature of [
+      "listAccess(fileId: string): Promise<DriveAccess[]>;",
+      "fileId: string, grantee: DriveGrantee, role: DriveShareRole, options?: DriveShareOptions,\n  ): Promise<DriveAccess>;",
+      "fileId: string, access: string | DriveGrantee, role: DriveShareRole,\n  ): Promise<DriveAccess>;",
+      "unshare(fileId: string, access: string | DriveGrantee): Promise<void>;",
+    ]) {
+      expect(writeTypes.split(signature), signature).toHaveLength(2);
+    }
+    // The account and folder sessions each declare a move; the file session declares none.
+    expect(writeTypes.split("move(fileId: string, folderId: string): Promise<void>;"))
+      .toHaveLength(3);
+    const writeProse = prose("drive-types.d.ts");
+    for (const phrase of [
+      "Only what the connected account can share has its sharing read or changed here",
+      "A shared drive itself is neither listed nor shared here",
+      "its members show as `inherited` access on anything in it",
+      "`updateAccess()` changes a role only: to change it, remove the access and, once that is " +
+        "approved, give it again.",
+      "A change still awaiting approval cannot be changed or removed from here: to withdraw it, " +
+        "have the user reject it.",
+      "The organization's sharing rules still apply, so an approved change can still fail",
+      "one entry per way they have it",
+      "has the same ID in every entry Drive lists; access still waiting to be given has its own " +
+        "`pending:` ID",
+      "access being removed is left out",
+      "A change awaiting approval on a folder does not show on what the folder holds",
+      "Sharing a folder shares everything in it.",
+      "at `role` or lower, is merged into the folder's, and is gone if the folder's access is " +
+        "later removed",
+      "whose role `updateAccess()` changes",
+      "the `id` `listAccess()` returned, or the grantee who has it",
+      "an address names the access whether it is given as a user's or as a group's",
+      "for a role at or below what a parent already gives",
+      "A role raised on a folder merges access to what the folder holds as `share()` does.",
+      "Fails for the access `updateAccess()` fails for: an owner's",
+      "Access the grantee also has from a parent stays.",
+      "The connected account's own access as a user, which cannot be changed or removed here.",
+      "it is the first where the grantee's entry is not `inherited`",
+      "One shared as a group's that is a person's is shared with that person.",
+      "if it is a group's, the approved share fails, and the group may have been given the access",
+      "when it is not known which an address is, ask the user before sharing with it",
+      "There are no others: access given here does not expire, and ownership is never transferred.",
+      "Both must be in the same drive: one shared drive, or neither in a shared drive.",
+      "Something in the trash, or in no folder the connected account can see, cannot be moved.",
+      "As `folderId`, `root` names the top level of My Drive; no other call takes it.",
+      "whose ID is the drive's: the `driveId` of anything in it",
+      "Moving changes who has access",
+      "does not come back if the file later leaves that folder",
+      "The move is made once the user approves it. Until then every read shows the file where it is",
+      "No read tells a move that still waits from one the user rejected",
+      "or `getScope().parentFolderId`, the folder this one was opened from",
+      "Nothing moves above the originally selected folder, or into it from outside.",
+      "While the move awaits approval, a comment, a sharing change or another move is refused for " +
+        "the same file",
+      "for anything inside it and for a move into it",
+      "One queued before the move fails if the move is approved ahead of it.",
+      "Once a folder has moved, a session opened at it no longer reaches it",
+      "except that `root` names nothing here",
+      "An address that has no Google account can be shared with only when it is emailed.",
+      "A pending ID names nothing once that access is decided",
+    ]) {
+      expect(writeProse, phrase).toContain(phrase);
+    }
+    // The file says that changes are queued for the user's approval, and nothing of how.
+    for (const word of ["submitAction", "applyAction", "revert", "journal"]) {
+      expect(writeProse, word).not.toContain(word);
+    }
+    // The compiler is all that holds these seams for typed callers: an unused `@ts-expect-error`
+    // is itself a diagnostic, so a refused call that the types accept fails this.
+    expect(compileAgentTypes(driveWriteBundle() + `
+declare const drive: GoogleDriveSession;
+declare const file: GoogleDriveFileSession;
+declare const folder: GoogleDriveFolderSession;
+async function stories(): Promise<void> {
+  const access: DriveAccess[] = await drive.listAccess("file-1");
+  const others = access.filter(entry => !entry.me && !entry.inherited && !entry.pending);
+  const source: string | undefined = access[0].inheritedFrom;
+  const pending: DriveAccess = await drive.share(
+    "file-1", { type: "user", emailAddress: "bob@example.com" }, "writer", { message: "Here it is." });
+  await file.share("file-1", { type: "group", emailAddress: "team@example.com" }, "commenter", { notify: false });
+  await folder.share("child-1", { type: "domain", domain: "example.com" }, "reader", { discoverable: true });
+  await drive.share("file-1", { type: "anyone" }, "reader");
+  const changed: DriveAccess = await drive.updateAccess("file-1", others[0].id, "reader");
+  await drive.updateAccess("file-1", { type: "user", emailAddress: "bob@example.com" }, "writer");
+  await file.unshare("file-1", others[0].id);
+  await file.unshare("file-1", { type: "group", emailAddress: "team@example.com" });
+  const address: string | undefined = others[0].emailAddress;
+  const shown: string | undefined = others[0].displayName;
+  await drive.share("file-2", { type: "user", emailAddress: address ?? "bob@example.com" }, "reader");
+  const scope: DriveScope = await folder.getScope();
+  if (scope.kind === "folder") {
+    await folder.share(scope.folderId, { type: "anyone" }, "reader");
+    if (scope.parentFolderId !== undefined) await folder.move("child-1", scope.parentFolderId);
+  }
+  await folder.move("child-1", "child-folder");
+  const child: GoogleDriveFolderSession = await folder.openFolder("child-folder");
+  await child.share("grandchild", { type: "anyone" }, "reader");
+  await drive.move("file-1", "folder-9");
+  await drive.move("file-1", "root");
+  const role: DriveRole = access[0].role;
+}
+// @ts-expect-error A single-file binding cannot move its file.
+file.move("file-1", "folder-9");
+// @ts-expect-error Ownership cannot be given.
+drive.share("file-1", { type: "user", emailAddress: "bob@example.com" }, "owner");
+// @ts-expect-error A shared drive's manager role cannot be given.
+drive.updateAccess("file-1", "1", "organizer");
+// @ts-expect-error A grantee is not named by a Drive ID.
+drive.share("file-1", { type: "user", id: "1" }, "reader");
+// @ts-expect-error Access is named by its ID or by a grantee.
+drive.unshare("file-1", 7);
+// @ts-expect-error No expiry.
+drive.share("file-1", { type: "anyone" }, "reader", { expires: "2027-01-01" });
+// @ts-expect-error No ownership transfer.
+drive.share("file-1", { type: "anyone" }, "reader", { transferOwnership: true });
+// @ts-expect-error A move takes one destination and nothing else.
+drive.move("file-1", "folder-9", { driveId: "d" });
+// @ts-expect-error A domain grantee carries no address.
+const mixed: DriveGrantee = { type: "domain", emailAddress: "a@example.com" };
+// @ts-expect-error A grantee's address is spelled emailAddress.
+drive.share("file-1", { type: "user", email: "bob@example.com" }, "reader");
+declare const entry: DriveAccess;
+// @ts-expect-error An entry's address is spelled emailAddress.
+entry.email;
+// @ts-expect-error An entry's name is spelled displayName.
+entry.name;
+// The literal above also lacks its domain, so this one holds the seam on the address alone.
+// @ts-expect-error A domain grantee carries no address, even with its domain.
+const mixedWithDomain: DriveGrantee = { type: "domain", domain: "example.com", emailAddress: "a@example.com" };
+`)).toEqual([]);
+  });
+
+  it("gives a read-only Drive session no sharing and no move, and a folder scope its parent", () => {
+    const readTypes = source("drive-read-types.d.ts");
+    expect(readTypes).not.toMatch(/^\s+(listAccess|share|updateAccess|unshare|move)\(/m);
+    const readProse = prose("drive-read-types.d.ts");
+    for (const phrase of [
+      "Commenting on files, seeing or changing who they are shared with, and moving them take a " +
+        "binding with read and write access",
+      "(which can be commented on and shared, not moved)",
+      "A folder binding moves a file only within that folder, one level per move",
+      "request a folder that holds both where the file is and where it goes, or all of Drive",
+      "The folder this one was opened from. Absent for the connected folder itself",
+      "which for an entry at the top level of My Drive is My Drive's own root folder",
+      "Absent for a root folder itself, and for an entry in no folder the connected account can see.",
+      "A binding connected with read and write access is read-only while its deployment keeps " +
+        "Google Drive read-only.",
+      "with the access the binding has",
+      "Where the deployment keeps Google Drive read-only, no binding has read and write access, " +
+        "whatever was requested, and a write fails saying so.",
+    ]) {
+      expect(readProse, phrase).toContain(phrase);
+    }
+    // An entry at the top level of My Drive has a parent, and a binding's access is what it has
+    // under its deployment, which may be less than it was connected with.
+    for (const phrase of [
+      "Absent when the entry is at a root", "the access the binding was connected with",
+    ]) {
+      expect(readProse, phrase).not.toContain(phrase);
+    }
+    expect(compileAgentTypes(driveReadBundle() + `
+declare const drive: GoogleDriveReadSession;
+declare const folder: GoogleDriveFolderReadSession;
+async function use(): Promise<void> {
+  const scope = await folder.getScope();
+  const parent: string | undefined = scope.kind === "folder" ? scope.parentFolderId : undefined;
+}
+// @ts-expect-error A read-only binding has no sharing.
+drive.listAccess("file-1");
+// @ts-expect-error A read-only binding has no share().
+drive.share("file-1", { type: "anyone" }, "reader");
+// @ts-expect-error A read-only binding has no move().
+drive.move("file-1", "folder-9");
+// @ts-expect-error A read-only folder binding has no unshare().
+folder.unshare("file-1", "1");
+// @ts-expect-error A read-only folder binding has no move().
+folder.move("file-1", "folder-9");
 `)).toEqual([]);
   });
 
