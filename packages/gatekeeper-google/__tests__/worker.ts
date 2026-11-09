@@ -6,7 +6,7 @@ import type {
 import { TestGitCache } from "./test-git-cache";
 import { ActionJournal } from "@gadgets/gatekeeper-kit/actions";
 import type { GoogleAccessToken } from "../src/google-api";
-import type { GoogleDocSession, GoogleDocTab } from "../src/docs-types";
+import type { GoogleDocSession, GoogleDocTab, NewDocTable } from "../src/docs-types";
 import type { MarkerEntry } from "../src/sheets-actions";
 import type { SpreadsheetInfo, SpreadsheetRange } from "../src/sheets-read-types";
 import type { GoogleSpreadsheetSession } from "../src/sheets-types";
@@ -34,10 +34,21 @@ export class UserAccount extends DurableObject<Env> {
 type GatekeeperProps = { userObjectId: string; documentId: string };
 
 type StorageOperation = { kind: "put"; key: string; value: unknown };
+/** The `fetchedAt` and `checkedAt` of a stored value, each present when it holds a number there. */
+type StoredTimes = { fetchedAt?: number; checkedAt?: number };
 type TestGoogleDocGatekeeper = GoogleDocGatekeeperImpl & {
   applyTestStorage(operations: StorageOperation[]): void;
   testStoredValueJsonLength(key: string): number | undefined;
+  testStoredTimes(key: string): StoredTimes | undefined;
 };
+
+/** The methods of a Google Doc session that queue an edit. */
+type DocWriteMethod =
+  | "replaceText" | "appendText" | "insertTable" | "insertTableRows" | "insertTableColumns"
+  | "deleteTableRows" | "deleteTableColumns" | "deleteTable";
+
+/** An action as the approval queue received it. */
+type SubmittedAction = { actionId: number; title: string };
 
 /** What one Slides session call returned or threw, and what it queued and observed. */
 type SlidesCall = {
@@ -67,9 +78,23 @@ class TestApprovalQueue extends RpcTarget implements ApprovalQueue {
   actionDescription?: string;
   actionFields: ActionField[] = [];
   readonly observations: string[] = [];
+  /** Every action submitted, in the order the calls arrived. */
+  readonly submitted: SubmittedAction[] = [];
+  /** Whether every observation is refused, as for a document its observers cannot read. */
+  refuseObservations = false;
+  /** Holds the next observation open until `released`, calling `reach` once it has arrived. */
+  holdObservation?: { reach(): void; released: Promise<void> };
 
   async authorizeObservation(description: ObservationDescription): Promise<void> {
     this.observations.push(description.description);
+    if (this.refuseObservations) throw new Error("Reads of this document are refused.");
+    let held = this.holdObservation;
+    if (held) {
+      // One hold, so a later observation of the same call is never held twice.
+      this.holdObservation = undefined;
+      held.reach();
+      await held.released;
+    }
   }
 
   async getGitCache(): Promise<GitCache> {
@@ -77,6 +102,7 @@ class TestApprovalQueue extends RpcTarget implements ApprovalQueue {
   }
 
   async submitAction(actionId: number, description: ActionDescription): Promise<void> {
+    this.submitted.push({ actionId, title: description.title });
     this.actionId = actionId;
     this.action = description;
     this.actionDescription = description.description;
@@ -93,6 +119,7 @@ class TestApprovalQueue extends RpcTarget implements ApprovalQueue {
 }
 
 export class TestHooks extends DurableObject<Env> {
+  #lastActionTitle = "";
   #lastActionDescription = "";
   #lastActionFields: ActionField[] = [];
   #lastActionVerdict: { actionKind?: ActionKind; autoApprovable?: boolean } = {};
@@ -101,6 +128,11 @@ export class TestHooks extends DurableObject<Env> {
   #classes = new Map<string, DurableObjectClass<Gatekeeper<any>>>();
   /** The class each facet's applyCreation() returned, until adoptCreated() switches to it. */
   #created = new Map<string, DurableObjectClass<Gatekeeper<any>>>();
+
+  /** The approval title of the edit most recently submitted through these hooks. */
+  get lastActionTitle(): string {
+    return this.#lastActionTitle;
+  }
 
   /** The approval description of the edit most recently submitted through these hooks. */
   get lastActionDescription(): string {
@@ -216,6 +248,7 @@ export class TestHooks extends DurableObject<Env> {
       // Awaited inside the scope: `return body(...)` would dispose both stubs mid-call.
       return await body(session, queue);
     } finally {
+      this.#lastActionTitle = queue.action?.title ?? "";
       this.#lastActionDescription = queue.actionDescription ?? "";
       this.#lastActionFields = queue.actionFields;
       this.#lastActionVerdict = {
@@ -248,6 +281,72 @@ export class TestHooks extends DurableObject<Env> {
       facetName, session => session.replaceText(oldMarkdown, newMarkdown, tabId));
   }
 
+  /**
+   * Call one write method of a fresh session, returning the ID of the action it queued and what
+   * it resolved to. With `refuseRead`, the session's approval queue refuses every observation.
+   */
+  async submitEdit(
+    facetName: string, method: DocWriteMethod, args: unknown[],
+    options: { refuseRead?: boolean } = {},
+  ): Promise<{ actionId: number; returned?: number }> {
+    return this.#withSession(facetName, async (session, queue) => {
+      queue.refuseObservations = options.refuseRead === true;
+      let returned = await (session[method] as (...args: unknown[]) => Promise<unknown>)(...args);
+      if (queue.actionId === undefined) throw new Error("Action was not submitted");
+      return {
+        actionId: queue.actionId,
+        ...(typeof returned === "number" ? { returned } : {}),
+      };
+    });
+  }
+
+  /**
+   * Four calls sent on one session without waiting for one another, the first held where it
+   * authorizes a read: `insertTable()`, then `appendText()`, `getContent()` and `getMetadata()`.
+   * Returns the actions in the order the approval queue received them, the position
+   * `insertTable()` resolved to, the content read, and the metadata's `lastModified` as epoch
+   * milliseconds.
+   */
+  async callsDuringTableRead(
+    facetName: string, table: NewDocTable, markdown: string, tabId?: string,
+  ): Promise<{ received: SubmittedAction[]; returned: number; read: string; modified: number }> {
+    return this.#withSession(facetName, async (session, queue) => {
+      let { promise: reached, resolve: reach } = Promise.withResolvers<void>();
+      let { promise: released, resolve: release } = Promise.withResolvers<void>();
+      queue.holdObservation = { reach, released };
+      try {
+        // Each is handled below, once all are sent; this only keeps it from reporting as unhandled.
+        let inserting = Promise.resolve(session.insertTable(table, tabId));
+        inserting.catch(() => {});
+        // A table call that stores first, or authorizes nothing, would never reach the hold.
+        let held = await Promise.race([
+          reached.then(() => true), inserting.then(() => false, () => false),
+        ]);
+        if (!held) throw new Error("insertTable authorized no read before settling");
+
+        // The table call is waiting for its position to be authorized, inside its turn.
+        let appending = Promise.resolve(session.appendText(markdown, tabId));
+        appending.catch(() => {});
+        let reading = Promise.resolve(session.getContent(tabId));
+        reading.catch(() => {});
+        let describing = Promise.resolve(session.getMetadata());
+        describing.catch(() => {});
+        // Calls on one stub are delivered in order, and this one waits for no turn: once it
+        // returns, the three before it have arrived and are waiting behind the table.
+        await session.listTabs();
+        release();
+
+        let [returned, , read, metadata] =
+          await Promise.all([inserting, appending, reading, describing]);
+        return {
+          received: queue.submitted, returned, read, modified: metadata.lastModified.valueOf(),
+        };
+      } finally {
+        release();
+      }
+    });
+  }
+
   /** The `lastModified` a metadata read reports, as epoch milliseconds. */
   async readMetadata(facetName: string): Promise<number> {
     return this.#withSession(
@@ -271,6 +370,14 @@ export class TestHooks extends DurableObject<Env> {
   async storedValueJsonLength(facetName: string, key: string): Promise<number | undefined> {
     return (this.#gatekeeper(facetName) as unknown as TestGoogleDocGatekeeper)
       .testStoredValueJsonLength(key);
+  }
+
+  /**
+   * The `fetchedAt` and `checkedAt` of the value stored under `key`, or `undefined` when nothing
+   * is stored there.
+   */
+  async storedTimes(facetName: string, key: string): Promise<StoredTimes | undefined> {
+    return (this.#gatekeeper(facetName) as Fetcher<TestGoogleDocGatekeeper>).testStoredTimes(key);
   }
 
   async applyAction(facetName: string, actionId: number): Promise<string | null> {
@@ -462,6 +569,19 @@ type TestDurableObjectState = { ctx: { storage: DurableObjectStorage } };
 ): number | undefined {
   let value = (this as unknown as TestDurableObjectState).ctx.storage.kv.get(key);
   return value === undefined ? undefined : JSON.stringify(value).length;
+};
+
+(GoogleDocGatekeeperImpl.prototype as TestGoogleDocGatekeeper).testStoredTimes = function(
+  this: TestDurableObjectState, key: string,
+): StoredTimes | undefined {
+  let value = this.ctx.storage.kv.get<Record<string, unknown>>(key);
+  if (value === undefined) return undefined;
+  let times: StoredTimes = {};
+  if (value && typeof value === "object") {
+    if (typeof value.fetchedAt === "number") times.fetchedAt = value.fetchedAt;
+    if (typeof value.checkedAt === "number") times.checkedAt = value.checkedAt;
+  }
+  return times;
 };
 
 type TestGoogleSlidesGatekeeper = GoogleSlidesGatekeeperImpl & { claimTestAction(id: number): void };
