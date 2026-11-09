@@ -3360,6 +3360,16 @@ export interface Overseer extends RpcTarget {
       : Promise<RpcStub<GadgetClient>>;
 
   /**
+   * Open a static snapshot of a gadget, for anyone who may open the gadget itself. A snapshot is a
+   * private copy of the gadget's stored state, taken now, served by the gadget's mainline code as
+   * of now, with no bindings and no network access. Because it can reach nothing the gadget can,
+   * opening one verifies nobody as an observer. Writes stay in the copy, and the copy is discarded
+   * when the returned capability is disposed (or the workspace restarts, or the gadget is
+   * deleted). Throws, like getGadget(), for a gadget the caller may not open.
+   */
+  getGadgetSnapshot(id: WorkpieceId): Promise<RpcStub<GadgetSnapshotClient>>;
+
+  /**
    * Read a commit's whole tree as nested TreeNodes: the root directory's entries, each
    * directory carrying its own, in git tree order (byte order of names, a directory sorting as
    * if its name had a trailing `/`). Only tree objects are read -- never blobs -- so the
@@ -6464,6 +6474,24 @@ export interface GadgetClient extends WorkpieceClient {
    */
   applyBlueprint(blueprintId: string, options: {modelId: string | null, allowUnrelated?: boolean})
       : Promise<ApplyBlueprintResult>;
+}
+
+/**
+ * A static snapshot of one gadget (see Overseer.getGadgetSnapshot()). It permits rendering,
+ * interacting with and exporting the snapshot, mainline-only (`chatId` must be omitted), and has
+ * none of GadgetClient's other methods.
+ */
+export interface GadgetSnapshotClient extends RpcTarget, Pick<GadgetClient,
+    "getId" | "getTitle" | "getUiBundle" | "connectToGadget" | "getExportFormats" | "export"> {
+  /** When the snapshot's state and code were copied from the gadget. */
+  getRefreshedAt(): Promise<Date>;
+
+  /**
+   * Replace the snapshot with a new copy of the gadget's current state and code, discarding
+   * anything written to the old copy, and return when the new copy was taken. Stubs returned by
+   * earlier connectToGadget() calls stop working; connect again.
+   */
+  refresh(): Promise<Date>;
 }
 
 /**

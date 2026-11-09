@@ -2,18 +2,20 @@ import { useEffect, useRef, useState } from 'react'
 import { DropdownMenu, Tooltip, useKumoToastManager } from '@cloudflare/kumo'
 import { DownloadSimple } from '@phosphor-icons/react'
 import type { RpcStub } from 'capnweb'
-import type { GadgetClient } from '@gadgets/workshop-shared/api'
+import type { GadgetClient, GadgetSnapshotClient } from '@gadgets/workshop-shared/api'
 import type { GadgetExportFormat } from '@gadgets/workshop-shared/api'
 import { WorkshopIconButton } from './components/WorkshopControls'
 import { makeExportFilename, saveStreamToFile } from './fileTransfers'
 
 type Props = {
-  gadget: RpcStub<GadgetClient> | null
+  gadget: RpcStub<GadgetClient> | RpcStub<GadgetSnapshotClient> | null
   gadgetTitle: string
   chatId?: number
+  // The trigger's name; a snapshot's menu exports the snapshot, not the live gadget.
+  label?: string
 }
 
-export default function GadgetExportMenu({ gadget, gadgetTitle, chatId }: Props) {
+export default function GadgetExportMenu({ gadget, gadgetTitle, chatId, label = 'Export gadget' }: Props) {
   const [formats, setFormats] = useState<GadgetExportFormat[] | null>(null)
   const [loading, setLoading] = useState(false)
   const [loadFailed, setLoadFailed] = useState(false)
@@ -82,7 +84,7 @@ export default function GadgetExportMenu({ gadget, gadgetTitle, chatId }: Props)
   if (!gadget) return null
 
   const exportingFormat = formats?.find(format => format.id === exportingId)
-  const tooltip = exportingFormat ? `Exporting to ${exportingFormat.label}` : 'Export Gadget'
+  const tooltip = exportingFormat ? `Exporting to ${exportingFormat.label}` : label
 
   return (
     <Tooltip content={tooltip} asChild>
@@ -91,7 +93,7 @@ export default function GadgetExportMenu({ gadget, gadgetTitle, chatId }: Props)
           <DropdownMenu.Trigger
             render={(
               <WorkshopIconButton
-                aria-label="Export Gadget"
+                aria-label={label}
                 disabled={exportingId !== null}
               >
                 <DownloadSimple size={17} />

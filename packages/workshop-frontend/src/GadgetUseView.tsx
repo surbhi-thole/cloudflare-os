@@ -6,6 +6,7 @@ import {
   AuthenticatedApi,
   Overseer,
   GadgetClient,
+  GadgetSnapshotClient,
   WorkspaceMetadata,
   WorkpieceId,
   GadgetSummary,
@@ -17,6 +18,7 @@ import { GadgetPresence } from './components/GadgetPresence'
 import TopBarNotice from './TopBarNotice'
 import SiteLogo from './components/SiteLogo'
 import GadgetExportMenu from './GadgetExportMenu'
+import { GadgetSnapshotStatus } from './GadgetSnapshotStatus'
 
 // The minimal, "use"-only experience: a shared top bar plus the gadget's deployed UI, and nothing
 // else. Collaborators with the "use" role may only render and interact with the gadget's mainline
@@ -33,7 +35,15 @@ import GadgetExportMenu from './GadgetExportMenu'
 type Props = {
   overseer: RpcStub<Overseer>
   // Null while the selected gadget is being admitted, or while the workspace has no gadgets.
-  gadget: RpcStub<GadgetClient> | null
+  gadget: RpcStub<GadgetClient> | RpcStub<GadgetSnapshotClient> | null
+  // Set while `gadget` is a static snapshot (see Overseer.getGadgetSnapshot) rather than the live
+  // gadget: when it was taken, how to take a new one, and how to verify for the live gadget.
+  snapshot: {
+    refreshedAt: Date
+    onRefresh: () => Promise<void>
+    onVerify: () => void
+    verifying: boolean
+  } | null
   selectedGadgetId: WorkpieceId | null
   // Why the selected gadget couldn't be opened, such as declining to choose connected accounts;
   // the collaborator can retry it or pick another gadget.
@@ -53,6 +63,7 @@ const TOPBAR_H = 56
 export default function GadgetUseView({
   overseer,
   gadget,
+  snapshot,
   selectedGadgetId,
   gadgets,
   gadgetOpenFailure,
@@ -115,11 +126,15 @@ export default function GadgetUseView({
           </div>
         )}
 
-        {/* Right: presence and user menu */}
+        {/* Right: snapshot status, presence and user menu */}
         <div className="flex items-center gap-2 flex-shrink-0">
+          {snapshot && gadgetOpenFailure === null && (
+            <GadgetSnapshotStatus {...snapshot} />
+          )}
           <GadgetExportMenu
             gadget={gadgetOpenFailure === null ? gadget : null}
             gadgetTitle={gadgets.find(g => g.id === selectedGadgetId)?.title ?? 'Gadget'}
+            label={snapshot ? 'Export snapshot' : undefined}
           />
           <span className="hidden md:inline-flex">
             <GadgetPresence
@@ -164,7 +179,8 @@ export default function GadgetUseView({
           </div>
         ) : gadget ? (
           <GadgetUI
-            key={selectedGadgetId}
+            // A refreshed snapshot is a new copy, running the gadget's code as of the refresh.
+            key={snapshot ? `${selectedGadgetId}@${snapshot.refreshedAt.getTime()}` : selectedGadgetId}
             gadget={gadget}
             height="100%"
             isVisible={true}

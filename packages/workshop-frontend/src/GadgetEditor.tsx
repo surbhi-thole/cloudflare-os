@@ -24,6 +24,7 @@ import SiteLogo from './components/SiteLogo'
 
 import {
   GadgetClient,
+  GadgetSnapshotClient,
   AiChatAuthorInfo,
   ConsoleLogSubscriber,
   ConsoleLogEvent,
@@ -70,7 +71,7 @@ import { useActionEntries, useActions } from './useActions'
 import DeleteConfirmationDialog from './components/DeleteConfirmationDialog'
 import ReconnectingChip from './components/ReconnectingChip'
 import WorkspaceOpenErrorPage from './components/WorkspaceOpenErrorPage'
-import { observerOpenFailureMessage, useWorkspaceOpen } from './useWorkspaceOpen'
+import { isObserverConfigCancelled, observerOpenFailureMessage, useWorkspaceOpen } from './useWorkspaceOpen'
 import { reportIssue } from './errorReporting'
 import GadgetExportMenu from './GadgetExportMenu'
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER, MENU_POSITIONER_STYLE } from './components/menuStyles'
@@ -476,6 +477,10 @@ export default function GadgetEditor() {
 
   // ── toasts ─────────────────────────────────────────────────────────────────────
   const toasts = useKumoToastManager()
+  // For effects that report through toasts: the manager is a fresh object each render, so as a
+  // dependency it would restart them.
+  const toastsRef = useRef(toasts)
+  toastsRef.current = toasts
 
   // ── core state ──────────────────────────────────────────────────────────────
   // The workspace's workpiece list (gadget-type workpieces only in v1), kept live via
@@ -485,8 +490,23 @@ export default function GadgetEditor() {
   const knownWorkpieceIdsRef = useRef<Set<WorkpieceId> | null>(null)
   // GadgetClient stub for the currently-selected gadget workpiece. Per-gadget operations (UI
   // bundle, RPC connection, bindings, blueprints) go through this stub. Null while the workspace
-  // has no (visible) gadgets, and while a use-only collaborator's gadget is being admitted.
-  const [gadget, setGadget] = useState<{ id: WorkpieceId; stub: RpcStub<GadgetClient> } | null>(null)
+  // has no (visible) gadgets, and while a use-only collaborator's gadget is being admitted. A
+  // use-only collaborator may instead hold a static snapshot of the gadget (see
+  // Overseer.getGadgetSnapshot), taken at `refreshedAt`.
+  const [gadget, setGadget] = useState<
+    | { id: WorkpieceId; kind: 'live'; stub: RpcStub<GadgetClient> }
+    | { id: WorkpieceId; kind: 'snapshot'; stub: RpcStub<GadgetSnapshotClient>; refreshedAt: Date }
+    | null
+  >(null)
+  // The gadgets a use-only collaborator chose to view as snapshots rather than verify their
+  // accounts for, in the workspace they chose them in.
+  const [snapshotChoices, setSnapshotChoices] =
+    useState<{ workspaceId: string; gadgetIds: ReadonlySet<WorkpieceId> } | null>(null)
+  // The snapshot whose collaborator asked to verify their accounts for the live gadget. The
+  // snapshot stays on screen until that admission succeeds, which hands over its live stub.
+  const [liveVerification, setLiveVerification] =
+    useState<{ workspaceId: string; gadgetId: WorkpieceId } | null>(null)
+  const admittedLiveRef = useRef<{ id: WorkpieceId; stub: RpcStub<GadgetClient> } | null>(null)
 
   // ── title editing ────────────────────────────────────────────────────────────
   const [isEditingTitle, setIsEditingTitle] = useState(false)
@@ -834,8 +854,9 @@ export default function GadgetEditor() {
 
   // The stub for the selected gadget arrives via an effect; during a switch it briefly lags the
   // selection, in which case gadget-dependent views render their empty states for a frame.
-  const selectedGadgetStub =
-    gadget !== null && gadget.id === selectedGadgetId ? gadget.stub : null
+  const selectedGadget = gadget !== null && gadget.id === selectedGadgetId ? gadget : null
+  // Editor views hold only a live gadget; a snapshot is rendered by GadgetUseView alone.
+  const selectedGadgetStub = selectedGadget?.kind === 'live' ? selectedGadget.stub : null
   // Only the selected chat's streaming drives this editor. Everything downstream then narrows it
   // further to the selected workpiece.
   const streamingActiveFile = streamingActiveFileState?.chatId === effectiveSelectedChatId
@@ -1332,18 +1353,33 @@ export default function GadgetEditor() {
   //   kept per gadget, since failing one leaves the others open. Re-admitting the gadget on screen
   //   (after a reconnect) leaves its UI mounted until the new stub arrives; anything else that
   //   holds a stub disposed below is cleared, so no UI can mount on one.
+  // - A use-only collaborator who chose a snapshot of the gadget instead, from its account
+  //   prompt, opens that: it verifies nothing, so it can't be refused for their accounts. Asking
+  //   to verify from the snapshot admits the live gadget alongside it, and on success the live
+  //   gadget replaces the snapshot with the stub that admission produced.
   const [gadgetOpenFailure, setGadgetOpenFailure] =
     useState<{ id: WorkpieceId; message: string } | null>(null)
   const [gadgetOpenAttempt, setGadgetOpenAttempt] = useState(0)
   const metadataLoaded = metadata !== null
+  const viewingSnapshot = selectedGadgetId !== null && snapshotChoices !== null &&
+    snapshotChoices.workspaceId === id && snapshotChoices.gadgetIds.has(selectedGadgetId)
+  const verifyingLive = viewingSnapshot && liveVerification?.workspaceId === id &&
+    liveVerification.gadgetId === selectedGadgetId
   useEffect(() => {
+    // The live stub a verification from the snapshot produced (see liveVerification), taken over
+    // below rather than admitting the collaborator a second time, or released if unusable here.
+    const admitted = admittedLiveRef.current
+    admittedLiveRef.current = null
+    const takeOver = admitted !== null && overseer !== null && metadataLoaded && isUseOnly &&
+      !viewingSnapshot && admitted.id === selectedGadgetId
+    if (admitted && !takeOver) admitted.stub[Symbol.dispose]()
     if (!overseer || !metadataLoaded || selectedGadgetId === null) {
       setGadget(null)
       return
     }
     if (!isUseOnly) {
       const stub = overseer.stub.getGadget(selectedGadgetId)
-      setGadget({ id: selectedGadgetId, stub })
+      setGadget({ id: selectedGadgetId, kind: 'live', stub })
       return () => {
         stub[Symbol.dispose]()
         // The next run sets its stub in the same effect flush, so this never unmounts a builder's
@@ -1353,28 +1389,55 @@ export default function GadgetEditor() {
     }
 
     const abort = new AbortController()
-    const configureObservers = createObserverConfigCallback(abort.signal)
+    const kind = viewingSnapshot ? 'snapshot' : 'live'
+    setGadget(previous => previous?.id === selectedGadgetId && previous.kind === kind ? previous : null)
+    setGadgetOpenFailure(null)
+    const fail = (caught: unknown) => {
+      if (abort.signal.aborted) return
+      setGadget(null)
+      setGadgetOpenFailure({
+        id: selectedGadgetId,
+        message: observerOpenFailureMessage(caught, 'gadget') ?? 'This gadget couldn’t be opened.',
+      })
+    }
+
+    if (viewingSnapshot) {
+      const opening = overseer.stub.getGadgetSnapshot(selectedGadgetId)
+      let stub: RpcStub<GadgetSnapshotClient> | null = null
+      Promise.all([opening, opening.getRefreshedAt()]).then(([opened, refreshedAt]) => {
+        // Kept through a duplicate, which outlives disposing what the open resolved to.
+        if (!abort.signal.aborted) {
+          stub = opened.dup()
+          setGadget({ id: selectedGadgetId, kind: 'snapshot', stub, refreshedAt })
+        }
+        opened[Symbol.dispose]()
+      }, fail)
+      return () => {
+        abort.abort()
+        opening[Symbol.dispose]()
+        stub?.[Symbol.dispose]()
+      }
+    }
+
+    if (takeOver) {
+      setGadget({ id: selectedGadgetId, kind: 'live', stub: admitted.stub })
+      return () => admitted.stub[Symbol.dispose]()
+    }
+
+    const configureObservers =
+      createObserverConfigCallback(abort.signal, { id: selectedGadgetId, offersSnapshot: true })
     const admission = overseer.stub.getGadget(selectedGadgetId, configureObservers)
     let stub: RpcStub<GadgetClient> | null = null
-    setGadget(previous => previous?.id === selectedGadgetId ? previous : null)
-    setGadgetOpenFailure(null)
     admission.then(
       opened => {
         // Kept through a duplicate, which outlives disposing what the admission resolved to.
         if (!abort.signal.aborted) {
           stub = opened.dup()
-          setGadget({ id: selectedGadgetId, stub })
+          setGadget({ id: selectedGadgetId, kind: 'live', stub })
         }
         opened[Symbol.dispose]()
       },
-      caught => {
-        if (abort.signal.aborted) return
-        setGadget(null)
-        setGadgetOpenFailure({
-          id: selectedGadgetId,
-          message: observerOpenFailureMessage(caught, 'gadget') ?? 'This gadget couldn’t be opened.',
-        })
-      },
+      fail,
     )
     return () => {
       abort.abort()
@@ -1382,8 +1445,80 @@ export default function GadgetEditor() {
       stub?.[Symbol.dispose]()
       configureObservers[Symbol.dispose]()
     }
-  }, [overseer, metadataLoaded, selectedGadgetId, isUseOnly, createObserverConfigCallback,
-      gadgetOpenAttempt])
+  }, [overseer, metadataLoaded, selectedGadgetId, isUseOnly, viewingSnapshot,
+      createObserverConfigCallback, gadgetOpenAttempt])
+
+  // Verify a use-only collaborator viewing the selected gadget's snapshot for the live gadget, as
+  // they asked from the snapshot's bar. Its prompt offers no snapshot: one is already on screen,
+  // and cancelling it leaves that snapshot in place. Leaving the gadget ends the verification
+  // rather than resuming it on return.
+  useEffect(() => {
+    if (!overseer || !verifyingLive || selectedGadgetId === null) return
+    const gadgetId = selectedGadgetId
+    const abort = new AbortController()
+    const configureObservers =
+      createObserverConfigCallback(abort.signal, { id: gadgetId, offersSnapshot: false })
+    const admission = overseer.stub.getGadget(gadgetId, configureObservers)
+    admission.then(
+      opened => {
+        // Kept through a duplicate, which outlives disposing what the admission resolved to.
+        if (!abort.signal.aborted) {
+          admittedLiveRef.current?.stub[Symbol.dispose]()
+          admittedLiveRef.current = { id: gadgetId, stub: opened.dup() }
+          setLiveVerification(null)
+          setSnapshotChoices(previous => {
+            if (previous === null) return null
+            const gadgetIds = new Set(previous.gadgetIds)
+            gadgetIds.delete(gadgetId)
+            return { ...previous, gadgetIds }
+          })
+        }
+        opened[Symbol.dispose]()
+      },
+      caught => {
+        if (abort.signal.aborted) return
+        setLiveVerification(null)
+        if (isObserverConfigCancelled(caught)) return
+        toastsRef.current.add({
+          title: observerOpenFailureMessage(caught, 'gadget') ?? 'Couldn’t verify your access to this gadget.',
+          variant: 'error',
+        })
+      },
+    )
+    return () => {
+      abort.abort()
+      admission[Symbol.dispose]()
+      configureObservers[Symbol.dispose]()
+      setLiveVerification(current => current?.gadgetId === gadgetId ? null : current)
+    }
+  }, [overseer, verifyingLive, selectedGadgetId, createObserverConfigCallback])
+
+  // Releases a handed-over live stub that no gadget open took over before unmounting.
+  useEffect(() => () => {
+    admittedLiveRef.current?.stub[Symbol.dispose]()
+    admittedLiveRef.current = null
+  }, [])
+
+  const verifyLiveFromSnapshot = () => {
+    if (id && selectedGadgetId !== null) setLiveVerification({ workspaceId: id, gadgetId: selectedGadgetId })
+  }
+
+  // Switch a use-only collaborator's `gadgetId` to a snapshot, from its account prompt. The
+  // admission waiting on that prompt is aborted as the selected gadget reopens, which dismisses it.
+  const viewSnapshotOf = (gadgetId: WorkpieceId) => {
+    if (!id) return
+    setSnapshotChoices(previous => ({
+      workspaceId: id,
+      gadgetIds: new Set(previous?.workspaceId === id ? previous.gadgetIds : []).add(gadgetId),
+    }))
+  }
+
+  const refreshSnapshot = async () => {
+    if (selectedGadget?.kind !== 'snapshot') return
+    const snapshot = selectedGadget
+    const refreshedAt = await snapshot.stub.refresh()
+    setGadget(current => current === snapshot ? { ...snapshot, refreshedAt } : current)
+  }
 
   // ── follow the agent across gadgets ─────────────────────────────────────────────
   // When the agent starts editing a gadget other than the selected one, switch the picker to it,
@@ -1539,13 +1674,17 @@ export default function GadgetEditor() {
   const TABBAR_H = 48   // h-12
 
   // Account prompts can arrive whenever something is opened: the workspace while it loads, or a
-  // gadget once it has, for a collaborator given individual gadgets.
+  // gadget once it has, for a collaborator given individual gadgets, who may view a snapshot of it
+  // instead unless they are verifying from one.
+  const promptedGadget = observerConfig?.gadget
   const observerConfigModal = observerConfig && (
     <ObserverConfigModal
       needs={observerConfig.needs}
       authenticatedApi={authenticatedApi}
       onConfirm={observerConfig.resolve}
       onCancel={cancelObserverConfig}
+      subject={promptedGadget ? 'gadget' : 'workspace'}
+      onViewSnapshot={promptedGadget?.offersSnapshot ? () => viewSnapshotOf(promptedGadget.id) : undefined}
     />
   )
   // Gone if it was deleted while shared, which closes its dialog.
@@ -1599,7 +1738,15 @@ export default function GadgetEditor() {
       <>
         <GadgetUseView
           overseer={overseer.stub}
-          gadget={selectedGadgetStub}
+          gadget={selectedGadget?.stub ?? null}
+          snapshot={selectedGadget?.kind === 'snapshot'
+            ? {
+              refreshedAt: selectedGadget.refreshedAt,
+              onRefresh: refreshSnapshot,
+              onVerify: verifyLiveFromSnapshot,
+              verifying: verifyingLive,
+            }
+            : null}
           selectedGadgetId={selectedGadgetId}
           gadgets={visibleGadgets}
           onSelectGadget={handleSelectWorkpiece}
