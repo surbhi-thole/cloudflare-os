@@ -60,6 +60,7 @@ const mocks = vi.hoisted(() => {
             return disposable
           },
           getGadget: () => disposable,
+          gadgetRequiresAccounts: async () => false,
           getGadgetSnapshot: () => disposable,
           listHooks: async () => [],
           subscribeToConsoleLogs: async () => disposable,
@@ -388,6 +389,8 @@ describe('GadgetEditor, admitting a use-only collaborator to gadgets', () => {
   const original = { overseer: workspace.overseer, metadata: workspace.metadata }
   let admissions: { resolve: () => void; reject: (error: Error) => void }[]
   let snapshots: { gadgetId: WorkpieceId; resolve: () => void; client: SnapshotClient }[]
+  // The gadgets that reach a connection requiring an account (Overseer.gadgetRequiresAccounts).
+  let requiringAccounts: ReadonlySet<WorkpieceId>
   type SnapshotClient = Client & Disposable & { refresh: () => Promise<Date> }
   const shownClient = () => mocks.useView?.gadget as Client | null | undefined
 
@@ -413,6 +416,7 @@ describe('GadgetEditor, admitting a use-only collaborator to gadgets', () => {
           admissions.push({ resolve: () => resolve({ dup: () => client, [Symbol.dispose]() {} }), reject })
           return Object.assign(promise, disposable)
         },
+        gadgetRequiresAccounts: async (gadgetId?: WorkpieceId) => requiringAccounts.has(gadgetId!),
         getGadgetSnapshot: (gadgetId?: WorkpieceId) => {
           const { promise, resolve } = Promise.withResolvers<unknown>()
           const client: SnapshotClient = {
@@ -431,6 +435,7 @@ describe('GadgetEditor, admitting a use-only collaborator to gadgets', () => {
   beforeEach(() => {
     admissions = []
     snapshots = []
+    requiringAccounts = new Set()
     mocks.useView = null
     mocks.observerModal = null
     workspace.metadata = { ...original.metadata, role: 'use' } as WorkspaceMetadata
@@ -518,12 +523,28 @@ describe('GadgetEditor, admitting a use-only collaborator to gadgets', () => {
     expect(snapshots.map(s => s.gadgetId)).toEqual([GADGET.id, GADGET.id])
   })
 
-  it('verifies for the live gadget over its snapshot, which stays until admission succeeds', async () => {
-    workspace.observerConfig = { needs: [], gadget: { id: GADGET.id, offersSnapshot: true }, resolve: () => {}, reject: () => {} }
+  it('opens a gadget that requires accounts as a snapshot without verifying, and one that requires none live', async () => {
+    requiringAccounts = new Set([GADGET.id])
     mocks.search = { w: GADGET.id }
     await openEditor('desktop')
-    await act(async () => mocks.observerModal!.onViewSnapshot!())
-    workspace.observerConfig = null
+    expect(admissions).toHaveLength(0)
+    expect(snapshots.map(s => s.gadgetId)).toEqual([GADGET.id])
+    await act(async () => snapshots[0].resolve())
+    expect(shownClient()).toBe(snapshots[0].client)
+
+    mocks.search = { w: BUDGET.id }
+    await openEditor('desktop')
+    expect(snapshots[0].client.disposed).toBe(true)
+    expect(snapshots).toHaveLength(1)
+    expect(admissions).toHaveLength(1)
+    expect(workspace.createObserverConfigCallback).toHaveBeenLastCalledWith(
+      expect.any(AbortSignal), { id: BUDGET.id, offersSnapshot: true })
+  })
+
+  it('verifies for the live gadget over its snapshot, which stays until admission succeeds', async () => {
+    requiringAccounts = new Set([GADGET.id])
+    mocks.search = { w: GADGET.id }
+    await openEditor('desktop')
     await act(async () => snapshots[0].resolve())
     const snapshot = snapshots[0].client
     const admitted = admissions.length
@@ -552,5 +573,13 @@ describe('GadgetEditor, admitting a use-only collaborator to gadgets', () => {
     expect(mocks.useView?.snapshot).toBeNull()
     expect(shownClient()).toMatchObject({ gadgetId: GADGET.id, disposed: false })
     expect(shownClient()).not.toBe(snapshot)
+
+    // From then on it opens live, its prompt offering the snapshot back.
+    workspace.overseer = useOnlyOverseer()
+    await openEditor('desktop')
+    expect(admissions).toHaveLength(admitted + 3)
+    expect(snapshots).toHaveLength(1)
+    expect(workspace.createObserverConfigCallback).toHaveBeenLastCalledWith(
+      expect.any(AbortSignal), { id: GADGET.id, offersSnapshot: true })
   })
 })

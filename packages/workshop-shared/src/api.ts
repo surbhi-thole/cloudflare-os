@@ -3370,6 +3370,15 @@ export interface Overseer extends RpcTarget {
   getGadgetSnapshot(id: WorkpieceId): Promise<RpcStub<GadgetSnapshotClient>>;
 
   /**
+   * Whether opening the gadget live requires the caller's connected accounts: true when the
+   * caller is a "use" collaborator and its observer scope includes an account-requiring connection
+   * or a legacy connection that cannot verify access. Such gadgets may open as snapshots instead;
+   * getGadget() still refuses an unverifiable legacy connection. False for the owner and "build"
+   * collaborators, whom opening the workspace verified. Throws for a gadget the caller may not open.
+   */
+  gadgetRequiresAccounts(id: WorkpieceId): Promise<boolean>;
+
+  /**
    * Read a commit's whole tree as nested TreeNodes: the root directory's entries, each
    * directory carrying its own, in git tree order (byte order of names, a directory sorting as
    * if its name had a trailing `/`). Only tree objects are read -- never blobs -- so the
@@ -6550,6 +6559,10 @@ export type PresenceParticipant = {
   key: string;
   user: AiChatAuthorInfo;
   role: CollaboratorRole;
+  /**
+   * Whether any of their sessions holds a static snapshot open (see Overseer.getGadgetSnapshot()).
+   */
+  viewingSnapshot: boolean;
 };
 
 /**

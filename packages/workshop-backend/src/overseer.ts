@@ -948,6 +948,8 @@ class OverseerImpl implements AgentHooks {
   // Subscribers to roster changes, registered via subscribeToPresence().
   #presenceSubscribers = new Map<object, RpcStub<PresenceSubscriber>>();
   #presenceKeyCounter = 0;
+  // How many snapshots each profile holds open (see joinSnapshotView()).
+  #snapshotViews = new Map<string, number>();
 
   #effectivePresenceRole(sessions: Map<object, CollaboratorRole>): CollaboratorRole {
     for (let role of sessions.values()) {
@@ -958,7 +960,10 @@ class OverseerImpl implements AgentHooks {
 
   #toParticipant(profileId: string): PresenceParticipant {
     let entry = this.#presence.get(profileId)!;
-    return { key: entry.key, user: entry.user, role: this.#effectivePresenceRole(entry.sessions) };
+    return {
+      key: entry.key, user: entry.user, role: this.#effectivePresenceRole(entry.sessions),
+      viewingSnapshot: this.#snapshotViews.has(profileId),
+    };
   }
 
   #broadcastPresenceAdd(participant: PresenceParticipant) {
@@ -1003,6 +1008,28 @@ class OverseerImpl implements AgentHooks {
       } else if (this.#effectivePresenceRole(e.sessions) !== before) {
         this.#broadcastPresenceAdd(this.#toParticipant(profileId));
       }
+    };
+  }
+
+  // Count a snapshot `profileId` holds open (see GadgetSnapshotClientImpl), so their presence says
+  // they are viewing one. Returns a function that uncounts it, like joinPresence().
+  joinSnapshotView(profileId: string): () => void {
+    let count = this.#snapshotViews.get(profileId) ?? 0;
+    this.#snapshotViews.set(profileId, count + 1);
+    if (count === 0 && this.#presence.has(profileId)) {
+      this.#broadcastPresenceAdd(this.#toParticipant(profileId));
+    }
+    let left = false;
+    return () => {
+      if (left) return;
+      left = true;
+      let remaining = this.#snapshotViews.get(profileId)! - 1;
+      if (remaining > 0) {
+        this.#snapshotViews.set(profileId, remaining);
+        return;
+      }
+      this.#snapshotViews.delete(profileId);
+      if (this.#presence.has(profileId)) this.#broadcastPresenceAdd(this.#toParticipant(profileId));
     };
   }
 
@@ -10444,17 +10471,24 @@ class OverseerImpl implements AgentHooks {
     return record?.type === "gadget" && !record.pending;
   }
 
-  // Selects the gatekeepers a non-owner observer holding `grant` must be verified against:
-  //   - "workspace" (a "build" collaborator, full access): every account-requiring gatekeeper.
-  //   - a "use" collaborator's gadget: only account-requiring gatekeepers the gadget reaches (see
-  //     #gadgetReach), since that is all a session holding it can reach -- plus every connection
-  //     through which a gadget it reaches recorded requirements, whose data that gadget's state
-  //     may hold whether or not it still binds the connection.
-  //
-  // The scope filter runs before observerVendorId(), which throws on a legacy record with no
-  // creationSpec: an unrelated legacy connection outside the caller's scope must not block their
-  // open, since nothing they can reach needs verification against it. An in-scope one still
-  // throws, fail-closed (and "build" scope is everything, so it always throws there).
+  // Connections in an observer's scope, before classifying whether they require an account.
+  // Includes both reachable connections and historical producers, even ones no longer bound.
+  #inScopeConnections(
+      grant: CollaboratorGrant,
+      reach = grant === "workspace" ? undefined : this.#gadgetReach(grant.gadgetId))
+      : GatekeeperRecord[] {
+    let ids = reach && new Set(
+        [...reach.gatekeeperIds, ...this.observerLedger.gadgetProducers(reach.gadgetIds)]);
+    let result: GatekeeperRecord[] = [];
+    for (let gk of this.storage.gatekeepers.list()) {
+      if (!ids || ids.has(gk.id)) result.push(gk);
+    }
+    return result;
+  }
+
+  // Selects account-requiring connections from the scope above. An in-scope legacy connection
+  // without creationSpec still throws via observerVendorId(), failing live admission closed;
+  // an unrelated one cannot block opening a gadget.
   //
   // TODO(known-risk): a "use" collaborator is never verified against a legacy producer that never
   //   reached their gadget, yet restricted data read from it can reach gadget state they see,
@@ -10462,21 +10496,12 @@ class OverseerImpl implements AgentHooks {
   //   risk -- never-bound producers" in plans/restricted-data-sharing.md.
   #inScopeGatekeepers(
       grant: CollaboratorGrant,
-      reach = grant === "workspace" ? undefined : this.#gadgetReach(grant.gadgetId))
-      : GatekeeperRecord[] {
-    let ids = reach && new Set(
-        [...reach.gatekeeperIds, ...this.observerLedger.gadgetProducers(reach.gadgetIds)]);
-
-    let result: GatekeeperRecord[] = [];
-    for (let gk of this.storage.gatekeepers.list()) {
-      if (ids && !ids.has(gk.id)) continue;
-      if (!observerVendorId(gk)) continue;
-      result.push(gk);
-    }
+      reach?: GadgetReach): GatekeeperRecord[] {
     // A simulated resource has no account behind it to verify anyone against. Approving its
     // creation restarts every session (see applyPendingAction), so verification happens then.
-    // (Filtered after the listing: reading another index mid-listing would end it.)
-    return result.filter(gk => !this.creationPending(gk.id));
+    // Filter after listing: creationPending reads another index, which would end the listing.
+    return this.#inScopeConnections(grant, reach)
+        .filter(gk => observerVendorId(gk) && !this.creationPending(gk.id));
   }
 
   listObserverRequirements(grant: CollaboratorGrant): ObserverBindingNeed[] {
@@ -10632,6 +10657,13 @@ class OverseerImpl implements AgentHooks {
     let access = (await this.getSharingManager()).getEffectiveAccess(profileId);
     return access !== undefined && accessIncludesGadget(access, gadgetId) &&
         this.isShareableGadget(gadgetId);
+  }
+
+  // Whether opening gadget `gadgetId` for a "use" collaborator needs account verification.
+  // Legacy connections cannot verify anyone, but must still select the snapshot opening path.
+  gadgetRequiresAccounts(gadgetId: WorkpieceId): boolean {
+    return this.#inScopeConnections({gadgetId}).some(gk =>
+        (!gk.creationSpec || connectionVendorId(gk)) && !this.creationPending(gk.id));
   }
 
   // The gate a "use" collaborator passes to get gadget `gadgetId` (UseOverseerInterface.getGadget):
@@ -12224,11 +12256,16 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     return new GadgetClientImpl(this.impl, id, this.clientUserId, this.#mintedCapabilityKind());
   }
 
+  async gadgetRequiresAccounts(id: WorkpieceId): Promise<boolean> {
+    this.impl.getGadgetRecord(id);  // validate it exists
+    return false;
+  }
+
   async getGadgetSnapshot(id: WorkpieceId): Promise<RpcStub<GadgetSnapshotClient>> {
     // @ts-expect-error An RpcTarget implementing the interface works in place of a stub, but the
     //     type system doesn't know this.
     return new GadgetSnapshotClientImpl(
-        this.impl, async () => true, this.impl.createGadgetSnapshot(id));
+        this.impl, this.clientProfileId, async () => true, this.impl.createGadgetSnapshot(id));
   }
 
   async deleteSelf(): Promise<void> {
@@ -13690,6 +13727,13 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
     return new UseGadgetClientInterface(this.impl, id, this.clientUserId);
   }
 
+  async gadgetRequiresAccounts(id: WorkpieceId): Promise<boolean> {
+    if (!await this.impl.mayOpenGadget(this.clientProfileId, id)) {
+      throw new Error(`No such gadget: ${id}`);
+    }
+    return this.impl.gadgetRequiresAccounts(id);
+  }
+
   // Unlike getGadget(), verifies nothing: a snapshot reaches none of what its gadget can (see
   // GadgetSnapshotClientImpl). A gadget their access does not include is refused the same way.
   async getGadgetSnapshot(id: WorkpieceId): Promise<RpcStub<GadgetSnapshotClient>> {
@@ -13697,7 +13741,8 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
     if (!await mayOpen()) throw new Error(`No such gadget: ${id}`);
     // @ts-expect-error An RpcTarget implementing the interface works in place of a stub, but the
     //     type system doesn't know this.
-    return new GadgetSnapshotClientImpl(this.impl, mayOpen, this.impl.createGadgetSnapshot(id));
+    return new GadgetSnapshotClientImpl(
+        this.impl, this.clientProfileId, mayOpen, this.impl.createGadgetSnapshot(id));
   }
 
   // --- Denied methods (build-only) ---
@@ -14239,15 +14284,19 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
 @validateRpc()
 class GadgetSnapshotClientImpl extends RpcTarget implements GadgetSnapshotClient {
   #snapshot: GadgetSnapshot;
+  #leaveSnapshotView: () => void;
 
-  // `mayOpen` says whether the holder may still open the gadget, checked before each refresh.
-  constructor(private impl: OverseerImpl, private mayOpen: () => Promise<boolean>,
-              snapshot: GadgetSnapshot) {
+  // Held by `profileId`, whose presence shows it while it is (see joinSnapshotView). `mayOpen`
+  // says whether they may still open the gadget, checked before each refresh.
+  constructor(private impl: OverseerImpl, profileId: string,
+              private mayOpen: () => Promise<boolean>, snapshot: GadgetSnapshot) {
     super();
     this.#snapshot = snapshot;
+    this.#leaveSnapshotView = impl.joinSnapshotView(profileId);
   }
 
   [Symbol.dispose]() {
+    this.#leaveSnapshotView();
     this.impl.deleteGadgetSnapshot(this.#snapshot.facetName);
   }
 

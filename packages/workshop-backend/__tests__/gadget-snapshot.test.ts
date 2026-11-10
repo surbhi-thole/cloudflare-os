@@ -11,7 +11,9 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
-import type { GadgetSnapshotClient, Overseer, PermissionEdge } from "@gadgets/workshop-shared/api";
+import type {
+  GadgetSnapshotClient, Overseer, PermissionEdge, PresenceParticipant,
+} from "@gadgets/workshop-shared/api";
 import type { OverseerDurableObject } from "../src/overseer.js";
 import type { GatekeeperRecord } from "../src/storage-schema/overseer-storage.js";
 import { openFakeOverseer } from "./fixtures.js";
@@ -114,10 +116,13 @@ function openViewer(impl: Impl): Promise<Overseer> {
       { role: "use", access: { role: "use", gadgetIds: "all" }, impl: {
         gitCache: impl.gitCache,
         mayOpenGadget: (...args: Parameters<Impl["mayOpenGadget"]>) => impl.mayOpenGadget(...args),
+        authorizeGadget: (...args: Parameters<Impl["authorizeGadget"]>) => impl.authorizeGadget(...args),
         createGadgetSnapshot: (id: number) => impl.createGadgetSnapshot(id),
         deleteGadgetSnapshot: (facetName: string) => impl.deleteGadgetSnapshot(facetName),
         getSnapshotFacet: (...args: Parameters<Impl["getSnapshotFacet"]>) =>
             impl.getSnapshotFacet(...args),
+        gadgetRequiresAccounts: (id: number) => impl.gadgetRequiresAccounts(id),
+        joinSnapshotView: (profileId: string) => impl.joinSnapshotView(profileId),
         getGadgetRecord: (id: number) => impl.getGadgetRecord(id),
       } });
 }
@@ -190,6 +195,7 @@ describe("gadget snapshots", () => {
     // The gadget never ran, so it has no stored state yet.
     await seedGadget(impl, GADGET_ID, { target: 7 });
     await seedGadget(impl, 2, { shared: false });
+    await seedGadget(impl, 3);
     let observed: number[] = [];
     impl.getGatekeeperFacet = (async (id: number) => ({
       addObserver: async () => { observed.push(id); },
@@ -202,6 +208,12 @@ describe("gadget snapshots", () => {
     expect(observed).toEqual([]);
     expect(impl.storage.observers.get(VIEWER)).toBeUndefined();
 
+    // The Workshop opens a gadget as a snapshot by default when its connections require accounts.
+    expect(await client.gadgetRequiresAccounts(GADGET_ID)).toBe(true);
+    expect(await client.gadgetRequiresAccounts(3)).toBe(false);
+    await expect(client.gadgetRequiresAccounts(2)).rejects.toThrow("No such gadget: 2");
+    expect(observed).toEqual([]);
+
     // Exactly the error a missing gadget gets.
     await expect(client.getGadgetSnapshot(2)).rejects.toThrow("No such gadget: 2");
     await expect(client.getGadgetSnapshot(999)).rejects.toThrow("No such gadget: 999");
@@ -210,6 +222,81 @@ describe("gadget snapshots", () => {
     impl.storage.collaborators.delete(VIEWER);
     await expect(snapshot.refresh()).rejects.toThrow(`No such gadget: ${GADGET_ID}`);
     expect(snapshotNames(impl)).toHaveLength(1);
+  }));
+
+  it.each(["bound", "historical"] as const)(
+      "open snapshots of gadgets with a %s legacy connection, but refuse live admission", source =>
+      withImpl(workspace(), async impl => {
+    impl.storage.gatekeepers.put({
+      id: 7, resourceTitle: "Legacy connection", class: fakeGatekeeperClass,
+    });
+    await seedGadget(impl, GADGET_ID, source === "bound" ? { target: 7 } : {});
+    if (source === "historical") {
+      let id = impl.storage.nextActionId.get();
+      impl.storage.nextActionId.put(id + 1);
+      impl.storage.actions.put({
+        id, gatekeeperId: 7, caller: { from: "gadget", gadgetId: GADGET_ID },
+        createdAt: new Date(0), state: "approved", type: "observation",
+        description: { title: "Read", description: "Cached data", subresources: ["document"] },
+      });
+    }
+    using gadget = await impl.getGadgetFacet(GADGET_ID);
+    await gadget.write("note", "cached data");
+    using client = await openViewer(impl);
+
+    expect(await client.gadgetRequiresAccounts(GADGET_ID)).toBe(true);
+    await expect(client.getGadget(GADGET_ID)).rejects.toThrow();
+    expect(impl.storage.observers.get(VIEWER)).toBeUndefined();
+    using snapshot = await client.getGadgetSnapshot(GADGET_ID);
+    using copy = await snapshot.connectToGadget();
+    expect(await copy.read("note")).toBe("cached data");
+  }));
+
+  it("opens account-free gadgets live despite an unrelated legacy connection", () =>
+      withImpl(workspace(), async impl => {
+    impl.storage.gatekeepers.put({
+      id: 7, resourceTitle: "Legacy connection", class: fakeGatekeeperClass,
+    });
+    impl.storage.gatekeepers.put({
+      id: 8, resourceTitle: "Model", class: fakeGatekeeperClass,
+      creationSpec: {
+        type: "aiModel", modelId: "model", provider: "anthropic", modelName: "claude",
+      },
+    });
+    await seedGadget(impl, GADGET_ID, { target: 8 });
+    await seedGadget(impl, 2, { target: 7, shared: false });
+    using client = await openViewer(impl);
+
+    expect(await client.gadgetRequiresAccounts(GADGET_ID)).toBe(false);
+    let user = impl.users.get(impl.users.idFromName(VIEWER));
+    expect(await impl.authorizeGadget(VIEWER, user, GADGET_ID)).toBe(true);
+    expect(impl.storage.observers.get(VIEWER)).toBeUndefined();
+  }));
+
+  it("requires accounts only after a simulated connection's creation is approved", () =>
+      withImpl(workspace(), async impl => {
+    impl.storage.gatekeepers.put({
+      id: 7, resourceTitle: "Connection", class: fakeGatekeeperClass,
+      creationSpec: { type: "gatekeeper", vendorId: "testvendor", typeUrlPattern: "https://*" },
+    });
+    await seedGadget(impl, GADGET_ID, { target: 7 });
+    let id = impl.storage.nextActionId.get();
+    impl.storage.nextActionId.put(id + 1);
+    impl.storage.actions.put({
+      id, gatekeeperId: 7, caller: { from: "agent", chatId: 1 }, createdAt: new Date(0),
+      state: "pending", type: "action", action: "create",
+      description: {
+        title: "Create connection", description: "Create resource", implementsRevert: false,
+        autoApprovable: false,
+      },
+    });
+    using client = await openViewer(impl);
+
+    expect(await client.gadgetRequiresAccounts(GADGET_ID)).toBe(false);
+    let creation = impl.storage.actions.get(id)!;
+    creation.state = "approved";
+    impl.storage.actions.put(creation);
+    expect(await client.gadgetRequiresAccounts(GADGET_ID)).toBe(true);
   }));
 
   it("are deleted when disposed, and with their gadget", () => withImpl(workspace(), async impl => {
@@ -230,6 +317,35 @@ describe("gadget snapshots", () => {
     await impl.removeWorkpiece(GADGET_ID);
     expect(snapshotNames(impl)).toEqual([]);
     await expect(kept.connectToGadget()).rejects.toThrow("This snapshot is no longer available.");
+  }));
+
+  it("show in their viewer's presence until the last one is disposed", () =>
+      withImpl(workspace(), async impl => {
+    await seedGadget(impl, GADGET_ID);
+    let roster = new Map<string, PresenceParticipant>();
+    let subscriber = {
+      dup: () => subscriber,
+      onRpcBroken: () => {},
+      [Symbol.dispose]: () => {},
+      init: async (list: PresenceParticipant[]) => { for (let p of list) roster.set(p.key, p); },
+      add: async (p: PresenceParticipant) => { roster.set(p.key, p); },
+      remove: async (key: string) => { roster.delete(key); },
+    };
+    using _subscription = impl.addPresenceSubscriber(subscriber as never);
+    let leave = impl.joinPresence(VIEWER, { type: "user", id: VIEWER, name: "Viewer" }, "use");
+    let viewing = () => Array.from(roster.values(), p => p.viewingSnapshot);
+    expect(viewing()).toEqual([false]);
+
+    using client = await openViewer(impl);
+    let first = await client.getGadgetSnapshot(GADGET_ID);
+    let second = await client.getGadgetSnapshot(GADGET_ID);
+    expect(viewing()).toEqual([true]);
+    await first.refresh();
+    first[Symbol.dispose]();
+    expect(viewing()).toEqual([true]);
+    second[Symbol.dispose]();
+    expect(viewing()).toEqual([false]);
+    leave();
   }));
 
   it("are deleted by the next instance, storage and all", async () => {

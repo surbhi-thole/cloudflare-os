@@ -79,8 +79,8 @@ const allDenied = (calls: object) =>
 // Everything else must be classified below, so a new Overseer or GadgetClient method fails to
 // compile until it is.
 type UseSurface = "getMetadata" | "subscribeToMetadata" | "subscribeToPresence" |
-    "subscribeToWorkpieces" | "getGadget" | "getGadgetSnapshot" | "listActions" |
-    "subscribeToActions" | "subscribeToConsoleLogs";
+    "subscribeToWorkpieces" | "getGadget" | "gadgetRequiresAccounts" | "getGadgetSnapshot" |
+    "listActions" | "subscribeToActions" | "subscribeToConsoleLogs";
 
 const DENIED_OVERSEER: Record<Exclude<keyof Overseer, keyof RpcTarget | UseSurface>,
     (ws: RpcStub<Overseer>) => unknown> = {
