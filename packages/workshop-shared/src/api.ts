@@ -3371,10 +3371,11 @@ export interface Overseer extends RpcTarget {
 
   /**
    * Whether opening the gadget live requires the caller's connected accounts: true when the
-   * caller is a "use" collaborator and its observer scope includes an account-requiring connection
-   * or a legacy connection that cannot verify access. Such gadgets may open as snapshots instead;
-   * getGadget() still refuses an unverifiable legacy connection. False for the owner and "build"
-   * collaborators, whom opening the workspace verified. Throws for a gadget the caller may not open.
+   * caller is a "use" collaborator and the gadget reaches a connection that requires an account
+   * or a legacy connection that cannot verify access. (That is, its observer scope includes
+   * one.) Such gadgets may open as snapshots instead; getGadget() still refuses an unverifiable
+   * legacy connection. False for the owner and "build" collaborators, whom opening the workspace
+   * verified. Throws for a gadget the caller may not open.
    */
   gadgetRequiresAccounts(id: WorkpieceId): Promise<boolean>;
 
