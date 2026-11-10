@@ -3,7 +3,6 @@ import { Badge, Tooltip, useKumoToastManager } from '@cloudflare/kumo'
 import { ArrowClockwise, Camera, Plug } from '@phosphor-icons/react'
 import { WorkshopIconButton } from './components/WorkshopControls'
 import { formatRelativeTime } from './Activity'
-import { formatFullTimestamp } from './utils/formatTimestamp'
 
 type Props = {
   refreshedAt: Date
@@ -42,12 +41,14 @@ export const GadgetSnapshotStatus = ({ refreshedAt, onRefresh, onVerify, verifyi
 
   return (
     <div className="flex min-w-0 items-center gap-1.5">
-      <Badge variant="secondary" icon={<Camera size={12} />}>Snapshot</Badge>
-      <span title={formatFullTimestamp(refreshedAt)} className="hidden whitespace-nowrap text-xs text-kumo-subtle lg:inline">
-        updated {formatRelativeTime(refreshedAt)}
-      </span>
-      <Tooltip content="Verify for full access" asChild>
-        <WorkshopIconButton aria-label="Verify for full access" disabled={verifying} onClick={onVerify}>
+      {/* Badge forwards no ref, so a focusable span carries the tooltip. */}
+      <Tooltip content={`Updated ${formatRelativeTime(refreshedAt)}`} asChild>
+        <span tabIndex={0} className="inline-flex rounded-full">
+          <Badge variant="secondary" icon={<Camera size={12} />}>Snapshot</Badge>
+        </span>
+      </Tooltip>
+      <Tooltip content="Verify access" asChild>
+        <WorkshopIconButton aria-label="Verify access" disabled={verifying} onClick={onVerify}>
           <Plug size={17} />
         </WorkshopIconButton>
       </Tooltip>

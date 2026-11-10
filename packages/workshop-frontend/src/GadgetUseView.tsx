@@ -19,6 +19,7 @@ import TopBarNotice from './TopBarNotice'
 import SiteLogo from './components/SiteLogo'
 import GadgetExportMenu from './GadgetExportMenu'
 import { GadgetSnapshotStatus } from './GadgetSnapshotStatus'
+import { GadgetSnapshotCard } from './GadgetSnapshotCard'
 
 // The minimal, "use"-only experience: a shared top bar plus the gadget's deployed UI, and nothing
 // else. Collaborators with the "use" role may only render and interact with the gadget's mainline
@@ -168,7 +169,7 @@ export default function GadgetUseView({
       )}
 
       {/* ═══ GADGET UI ══════════════════════════════════════════════════════════ */}
-      <div className="flex-1 min-h-0 overflow-hidden">
+      <div className="relative flex-1 min-h-0 overflow-hidden">
         {gadgetOpenFailure !== null ? (
           <div className="flex h-full flex-col items-center justify-center gap-4 px-6 text-center">
             {/* Verification denials list one line per failed connection, so preserve newlines. */}
@@ -178,13 +179,25 @@ export default function GadgetUseView({
             </WorkshopButton>
           </div>
         ) : gadget ? (
-          <GadgetUI
-            // A refreshed snapshot is a new copy, running the gadget's code as of the refresh.
-            key={snapshot ? `${selectedGadgetId}@${snapshot.refreshedAt.getTime()}` : selectedGadgetId}
-            gadget={gadget}
-            height="100%"
-            isVisible={true}
-          />
+          <>
+            <GadgetUI
+              // A refreshed snapshot is a new copy, running the gadget's code as of the refresh.
+              key={snapshot ? `${selectedGadgetId}@${snapshot.refreshedAt.getTime()}` : selectedGadgetId}
+              gadget={gadget}
+              height="100%"
+              isVisible={true}
+            />
+            {snapshot && (
+              <GadgetSnapshotCard
+                // Dismissing it hides it for this snapshot only.
+                key={`${selectedGadgetId}@${snapshot.refreshedAt.getTime()}`}
+                ownerName={metadata.owner?.name}
+                refreshedAt={snapshot.refreshedAt}
+                onVerify={snapshot.onVerify}
+                verifying={snapshot.verifying}
+              />
+            )}
+          </>
         ) : (
           <div className="flex h-full items-center justify-center px-6 text-center">
             <p className="text-sm text-kumo-subtle">
